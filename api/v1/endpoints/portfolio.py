@@ -562,7 +562,7 @@ def _resolve_position_analysis_context(
     summary="Parse broker CSV into normalized trade records",
 )
 def parse_csv_import(
-    broker: str = Form(..., description="Broker id: huatai/citic/cmb"),
+    broker: str = Form(..., description="Broker id: huatai/citic/cmb/schwab"),
     file: UploadFile = File(...),
 ) -> PortfolioImportParseResponse:
     importer = PortfolioImportService()
@@ -572,6 +572,7 @@ def parse_csv_import(
         return PortfolioImportParseResponse(
             broker=parsed["broker"],
             record_count=parsed["record_count"],
+            duplicate_count=parsed.get("duplicate_count", 0),
             skipped_count=parsed["skipped_count"],
             error_count=parsed["error_count"],
             records=[_serialize_import_record(item) for item in parsed.get("records", [])],
@@ -605,7 +606,7 @@ def list_csv_brokers() -> PortfolioImportBrokerListResponse:
 )
 def commit_csv_import(
     account_id: int = Form(...),
-    broker: str = Form(..., description="Broker id: huatai/citic/cmb"),
+    broker: str = Form(..., description="Broker id: huatai/citic/cmb/schwab"),
     dry_run: bool = Form(False),
     file: UploadFile = File(...),
 ) -> PortfolioImportCommitResponse:

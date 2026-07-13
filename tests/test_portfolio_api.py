@@ -953,6 +953,7 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertIn("huatai", brokers)
         self.assertIn("citic", brokers)
         self.assertIn("cmb", brokers)
+        self.assertIn("schwab", brokers)
 
     def test_event_list_invalid_page_size_returns_422(self) -> None:
         resp = self.client.get("/api/v1/portfolio/trades", params={"page_size": 101})

@@ -314,7 +314,7 @@ describe('PortfolioPage FX refresh', () => {
     deleteCashLedger.mockResolvedValue({ deleted: 1 });
     createCorporateAction.mockResolvedValue({ id: 1 });
     deleteCorporateAction.mockResolvedValue({ deleted: 1 });
-    parseCsvImport.mockResolvedValue({ broker: 'huatai', recordCount: 0, skippedCount: 0, errorCount: 0, records: [], errors: [] });
+    parseCsvImport.mockResolvedValue({ broker: 'huatai', recordCount: 0, duplicateCount: 0, skippedCount: 0, errorCount: 0, records: [], errors: [] });
     commitCsvImport.mockResolvedValue({
       accountId: 1,
       recordCount: 0,

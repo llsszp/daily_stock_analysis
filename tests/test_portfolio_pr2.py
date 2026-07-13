@@ -145,6 +145,21 @@ class PortfolioPr2TestCase(unittest.TestCase):
             )
         return csv_text.encode("utf-8")
 
+    @staticmethod
+    def _schwab_position_csv_bytes() -> bytes:
+        csv_text = (
+            "\ufeff账户33979888SCHW (Individual)于7/13/26 14:34:27的仓位概览\n"
+            "\n"
+            "股票和股票期权\n"
+            "金融产品,数量,\u200b天数,\u200b交易价格,中间价,中间价变动,开仓盈/亏,\u200b当天盈/亏,购买力影响\n"
+            "AMZN,+1,,246.95,244.58,-.76,($2.37),($0.76),$183.43\n"
+            "AMAZON.COM INC,+1,,246.95,244.58,-.76,($2.37),($0.76),\n"
+            "MSFT,+7,,463.725,386.13,+1.03,($543.17),$7.21,\"$2,027.18\"\n"
+            "MICROSOFT CORP,+7,,463.725,386.13,+1.03,($543.17),$7.21,\n"
+            "\u200b小计:,,,,,,($545.54),$6.45,\"$2,210.61\"\n"
+        )
+        return csv_text.encode("utf-8")
+
     def test_import_dedup_trade_uid_and_hash(self) -> None:
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
         aid = account["id"]
@@ -198,8 +213,62 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertIn("huatai", broker_map)
         self.assertIn("citic", broker_map)
         self.assertIn("cmb", broker_map)
+        self.assertIn("schwab", broker_map)
         self.assertIn("zhongxin", broker_map["citic"]["aliases"])
         self.assertIn("zhaoshang", broker_map["cmb"]["aliases"])
+        self.assertIn("thinkorswim", broker_map["schwab"]["aliases"])
+
+    def test_import_schwab_position_statement_deduplicates_name_rows(self) -> None:
+        parsed = self.import_service.parse_trade_csv(
+            broker="thinkorswim",
+            content=self._schwab_position_csv_bytes(),
+        )
+
+        self.assertEqual(parsed["broker"], "schwab")
+        self.assertEqual(parsed["record_count"], 2)
+        self.assertEqual(parsed["duplicate_count"], 2)
+        self.assertEqual(parsed["skipped_count"], 0)
+        self.assertEqual([item["symbol"] for item in parsed["records"]], ["AMZN", "MSFT"])
+        self.assertEqual(parsed["records"][0]["trade_date"], date(2026, 7, 13))
+        self.assertEqual(parsed["records"][0]["quantity"], 1.0)
+        self.assertEqual(parsed["records"][0]["price"], 246.95)
+        self.assertEqual(parsed["records"][0]["market"], "us")
+        self.assertEqual(parsed["records"][0]["currency"], "USD")
+
+    def test_import_schwab_position_statement_is_idempotent(self) -> None:
+        account = self.service.create_account(name="Schwab", broker="Schwab", market="us", base_currency="USD")
+        parsed = self.import_service.parse_trade_csv(
+            broker="schwab",
+            content=self._schwab_position_csv_bytes(),
+        )
+
+        first = self.import_service.commit_trade_records(
+            account_id=account["id"],
+            broker="schwab",
+            records=parsed["records"],
+        )
+        second = self.import_service.commit_trade_records(
+            account_id=account["id"],
+            broker="schwab",
+            records=parsed["records"],
+        )
+
+        self.assertEqual(first["inserted_count"], 2)
+        self.assertEqual(second["inserted_count"], 0)
+        self.assertEqual(second["duplicate_count"], 2)
+
+    def test_import_schwab_parse_endpoint_reports_source_duplicates(self) -> None:
+        response = self.client.post(
+            "/api/v1/portfolio/imports/csv/parse",
+            data={"broker": "schwab"},
+            files={"file": ("position-statement.csv", self._schwab_position_csv_bytes(), "text/csv")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["broker"], "schwab")
+        self.assertEqual(payload["record_count"], 2)
+        self.assertEqual(payload["duplicate_count"], 2)
 
     def test_import_preserves_leading_zero_symbol(self) -> None:
         csv_text = (

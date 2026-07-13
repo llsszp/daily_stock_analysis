@@ -232,6 +232,7 @@ class PortfolioImportTradeItem(BaseModel):
 class PortfolioImportParseResponse(BaseModel):
     broker: str
     record_count: int
+    duplicate_count: int = 0
     skipped_count: int
     error_count: int
     records: List[PortfolioImportTradeItem] = Field(default_factory=list)

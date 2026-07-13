@@ -301,6 +301,7 @@ export interface PortfolioImportTradeItem {
 export interface PortfolioImportParseResponse {
   broker: string;
   recordCount: number;
+  duplicateCount?: number;
   skippedCount: number;
   errorCount: number;
   records: PortfolioImportTradeItem[];

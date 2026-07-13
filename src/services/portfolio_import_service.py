@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
@@ -72,6 +74,12 @@ DEFAULT_PARSER_SPECS: Tuple[CsvParserSpec, ...] = (
             "price": ("成交价", "成交价格", "成交均价", "均价"),
             "trade_uid": ("流水号", "成交编号", "成交序号"),
         },
+    ),
+    CsvParserSpec(
+        broker="schwab",
+        aliases=("thinkorswim", "tos"),
+        display_name="嘉信证券 / thinkorswim",
+        column_hints={},
     ),
 )
 
@@ -147,6 +155,9 @@ class PortfolioImportService:
         content: bytes,
     ) -> Dict[str, Any]:
         broker_norm = self._normalize_broker(broker)
+        if broker_norm == "schwab":
+            return self._parse_schwab_position_csv(content)
+
         parser_spec = self._parser_registry[broker_norm]
         df = self._read_csv(content)
 
@@ -173,6 +184,81 @@ class PortfolioImportService:
         return {
             "broker": broker_norm,
             "record_count": len(records),
+            "duplicate_count": 0,
+            "skipped_count": skipped,
+            "error_count": len(errors),
+            "records": records,
+            "errors": errors[:20],
+        }
+
+    def _parse_schwab_position_csv(self, content: bytes) -> Dict[str, Any]:
+        text = self._decode_csv_text(content)
+        lines = text.splitlines()
+        statement_date = self._extract_schwab_statement_date(text)
+        header_index = self._find_schwab_position_header(lines)
+        if header_index is None:
+            raise ValueError("无法识别嘉信证券持仓文件：未找到‘金融产品,数量,交易价格’表头")
+
+        records: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        skipped = 0
+        duplicate_count = 0
+        previous_position_signature: Optional[Tuple[str, ...]] = None
+
+        for offset, values in enumerate(csv.reader(lines[header_index + 1 :]), start=header_index + 2):
+            row = [self._clean_schwab_cell(value) for value in values]
+            if not row or not any(row):
+                continue
+
+            product = row[0]
+            if product.startswith(("小计", "总计")):
+                break
+            if len(row) < 4:
+                skipped += 1
+                continue
+
+            signature = tuple(row[1:6])
+            symbol = self._normalize_schwab_symbol(product)
+            if symbol is None:
+                if previous_position_signature is not None and signature == previous_position_signature:
+                    duplicate_count += 1
+                else:
+                    skipped += 1
+                continue
+
+            quantity = self._parse_schwab_number(row[1])
+            price = self._parse_schwab_number(row[3])
+            if quantity is None or quantity == 0 or price is None or price <= 0:
+                skipped += 1
+                continue
+            if quantity < 0:
+                errors.append(f"row={offset}: 暂不支持空头持仓 {symbol}")
+                skipped += 1
+                previous_position_signature = signature
+                continue
+
+            record = {
+                "trade_date": statement_date,
+                "symbol": symbol,
+                "side": "buy",
+                "quantity": float(quantity),
+                "price": float(price),
+                "fee": 0.0,
+                "tax": 0.0,
+                "trade_uid": f"schwab-position:{statement_date.isoformat()}:{symbol}",
+                "market": "us",
+                "currency": "USD",
+                "note": "schwab_position_statement",
+                "_source_line_number": offset,
+            }
+            record["dedup_hash"] = self._build_dedup_hash(record)
+            records.append(record)
+            previous_position_signature = signature
+
+        return {
+            "broker": "schwab",
+            "record_count": len(records),
+            "duplicate_count": duplicate_count,
             "skipped_count": skipped,
             "error_count": len(errors),
             "records": records,
@@ -276,6 +362,61 @@ class PortfolioImportService:
             supported = ", ".join(sorted(self._parser_registry.keys()))
             raise ValueError(f"broker must be one of: {supported}")
         return broker
+
+    @staticmethod
+    def _decode_csv_text(content: bytes) -> str:
+        for encoding in ("utf-8-sig", "gbk", "gb18030"):
+            try:
+                return content.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return content.decode("utf-8", errors="replace")
+
+    @classmethod
+    def _find_schwab_position_header(cls, lines: List[str]) -> Optional[int]:
+        for index, line in enumerate(lines):
+            try:
+                columns = [cls._clean_schwab_cell(value) for value in next(csv.reader([line]))]
+            except (csv.Error, StopIteration):
+                continue
+            if columns and columns[0] == "金融产品" and "数量" in columns and "交易价格" in columns:
+                return index
+        return None
+
+    @staticmethod
+    def _extract_schwab_statement_date(text: str) -> date:
+        match = re.search(r"于\s*(\d{1,2}/\d{1,2}/\d{2,4})", text)
+        if match:
+            parsed = pd.to_datetime(match.group(1), format="mixed", errors="coerce")
+            if not pd.isna(parsed):
+                return parsed.date()
+        return date.today()
+
+    @staticmethod
+    def _clean_schwab_cell(value: Any) -> str:
+        return str(value or "").replace("\ufeff", "").replace("\u200b", "").strip()
+
+    @classmethod
+    def _normalize_schwab_symbol(cls, value: Any) -> Optional[str]:
+        symbol = cls._clean_schwab_cell(value).upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9]*(?:[./-][A-Z0-9]+)?", symbol):
+            return None
+        if len(symbol) > 12:
+            return None
+        return canonical_stock_code(symbol.replace("/", "."))
+
+    @classmethod
+    def _parse_schwab_number(cls, value: Any) -> Optional[float]:
+        text = cls._clean_schwab_cell(value)
+        if not text:
+            return None
+        negative = text.startswith("(") and text.endswith(")")
+        text = text.strip("()").replace("$", "").replace(",", "").replace("+", "")
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        return -abs(number) if negative else number
 
     @staticmethod
     def _read_csv(content: bytes) -> pd.DataFrame:

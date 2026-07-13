@@ -81,6 +81,7 @@ export function formatBrokerLabel(value: string, displayName?: string): string {
   if (value === 'huatai') return 'huatai（华泰）';
   if (value === 'citic') return 'citic（中信）';
   if (value === 'cmb') return 'cmb（招商）';
+  if (value === 'schwab') return 'schwab（嘉信证券 / thinkorswim）';
   return value;
 }
 
