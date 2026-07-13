@@ -2711,6 +2711,26 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertNotIn("WECHAT_WEBHOOK_URL", self.env_path.read_text(encoding="utf-8"))
         self.assertEqual(mock_post.call_args.kwargs["timeout"], 3)
 
+    @patch("src.notification_sender.dingtalk_sender.requests.post")
+    def test_test_notification_channel_supports_dingtalk_webhook(self, mock_post) -> None:
+        mock_post.return_value = self._mock_http_response(200, {"errcode": 0})
+
+        with self._notification_test_env():
+            payload = self.service.test_notification_channel(
+                channel="dingtalk",
+                items=[{
+                    "key": "DINGTALK_WEBHOOK_URL",
+                    "value": "https://oapi.dingtalk.com/robot/send?access_token=secret",
+                }],
+                title="Test title",
+                content="hello",
+                timeout_seconds=3,
+            )
+
+        self.assertTrue(payload["success"])
+        self.assertIn("access_token=***", payload["attempts"][0]["target"])
+        self.assertEqual(mock_post.call_args.kwargs["timeout"], 3)
+
     def test_test_notification_channel_reports_missing_config(self) -> None:
         with self._notification_test_env():
             payload = self.service.test_notification_channel(

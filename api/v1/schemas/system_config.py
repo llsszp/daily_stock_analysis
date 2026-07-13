@@ -12,6 +12,7 @@ GenerationBackendSmokeMode = Literal["text", "json"]
 GenerationBackendHealthStatus = Literal["not_tested", "passed", "failed", "skipped"]
 NotificationTestChannel = Literal[
     "wechat",
+    "dingtalk",
     "feishu",
     "telegram",
     "email",

@@ -261,6 +261,7 @@ export interface TestLLMChannelResponse {
 
 export type NotificationTestChannel =
   | 'wechat'
+  | 'dingtalk'
   | 'feishu'
   | 'telegram'
   | 'email'

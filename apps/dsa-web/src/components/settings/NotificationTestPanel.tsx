@@ -15,6 +15,7 @@ import { SettingsSectionCard } from './SettingsSectionCard';
 function getChannelOptions(language: 'zh' | 'en'): Array<{ value: NotificationTestChannel; label: string }> {
   return [
     { value: 'wechat', label: language === 'en' ? 'WeCom' : '企业微信' },
+    { value: 'dingtalk', label: language === 'en' ? 'DingTalk' : '钉钉' },
     { value: 'feishu', label: language === 'en' ? 'Feishu Webhook' : '飞书 Webhook' },
     { value: 'telegram', label: 'Telegram' },
     { value: 'email', label: language === 'en' ? 'Email' : '邮件' },
