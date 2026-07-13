@@ -498,6 +498,22 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         self.assertIn("PULL", symbols)
         self.assertGreater(meta["basket_counts"]["controlled_pullback"], 0)
 
+    def test_nasdaq_universe_uses_stale_cache_when_refresh_fails(self) -> None:
+        stale_rows = [{"symbol": "AAPL", "name": "Apple Inc."}]
+        alphasift_service._DSA_US_NASDAQ_UNIVERSE_CACHE = None
+
+        with (
+            patch(
+                "src.services.alphasift_service._read_dsa_us_nasdaq_universe_cache",
+                side_effect=[[], stale_rows],
+            ),
+            patch("requests.get", side_effect=OSError("network unavailable")),
+        ):
+            rows = alphasift_service._fetch_dsa_us_nasdaq_screener_rows()
+
+        self.assertEqual(rows, stale_rows)
+        alphasift_service._DSA_US_NASDAQ_UNIVERSE_CACHE = None
+
     def test_us_universe_prioritizes_dynamic_rows_and_includes_liquid_etfs(self) -> None:
         config = self._config(enabled=True)
         config.stock_list = ["TSLA", "SPY"]

@@ -2547,19 +2547,32 @@ def _fetch_dsa_us_nasdaq_screener_rows() -> List[Dict[str, Any]]:
 
     import requests
 
-    response = requests.get(
-        "https://api.nasdaq.com/api/screener/stocks",
-        params={"tableonly": "true", "limit": "25", "offset": "0", "download": "true"},
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Origin": "https://www.nasdaq.com",
-            "Referer": "https://www.nasdaq.com/market-activity/stocks/screener",
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    try:
+        response = requests.get(
+            "https://api.nasdaq.com/api/screener/stocks",
+            params={"tableonly": "true", "limit": "25", "offset": "0", "download": "true"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/plain,*/*",
+                "Origin": "https://www.nasdaq.com",
+                "Referer": "https://www.nasdaq.com/market-activity/stocks/screener",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        stale_rows = _read_dsa_us_nasdaq_universe_cache(allow_stale=True)
+        if not stale_rows:
+            raise
+        logger.warning(
+            "Nasdaq US universe refresh failed; using stale cache with %d rows: %s",
+            len(stale_rows),
+            exc,
+        )
+        with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
+            _DSA_US_NASDAQ_UNIVERSE_CACHE = (now, stale_rows)
+        return [dict(row) for row in stale_rows]
     rows = ((payload.get("data") or {}).get("rows") or []) if isinstance(payload, dict) else []
     normalized_rows = [dict(row) for row in rows if isinstance(row, dict)]
     if not normalized_rows:
