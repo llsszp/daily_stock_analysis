@@ -2749,6 +2749,19 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
                 return_value={
                     "success": True,
                     "provider": "test",
+                    "provider_attempts": [
+                        {
+                            "provider": "Tavily",
+                            "status": "quota_exhausted",
+                            "result_count": 0,
+                        },
+                        {
+                            "provider": "SerpAPI",
+                            "status": "success",
+                            "result_count": 1,
+                            "direct_count": 1,
+                        },
+                    ],
                     "results": [{"title": "贵州茅台最新公告", "source": "测试源"}],
                 },
             ),
@@ -2768,6 +2781,65 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(candidate["dsa_news"][0]["title"], "贵州茅台最新公告")
         self.assertIn("DSA行情", candidate["dsa_analysis_summary"])
         self.assertEqual(payload["dsa_enrichment"]["enriched_count"], 1)
+        quota_warning = "新闻渠道 Tavily 调用额度已用尽，已按顺序尝试其他可用渠道。"
+        self.assertIn(quota_warning, candidate["dsa_context"]["warnings"])
+        self.assertIn(quota_warning, payload["warnings"])
+
+    def test_us_stock_news_filters_stale_supplier_article(self) -> None:
+        search_service = MagicMock()
+        search_service.is_available = True
+        search_service.search_stock_news.return_value = SimpleNamespace(
+            query="AAPL Apple stock latest news",
+            provider="test",
+            success=True,
+            error_message="fallback: https://example.com/search?api_key=secret-value",
+            provider_attempts=[
+                {
+                    "provider": "Tavily",
+                    "status": "quota_exhausted",
+                    "result_count": 0,
+                    "message": "Monthly quota exceeded: https://example.com/search?api_key=secret-value",
+                },
+                {
+                    "provider": "SerpAPI",
+                    "status": "success",
+                    "result_count": 2,
+                    "direct_count": 1,
+                    "message": "found direct news",
+                },
+            ],
+            results=[
+                SimpleNamespace(
+                    title="2024 Most Anticipated IPO: Apple Supply Chain Giant Debuts",
+                    snippet="A supplier riding Apple's coattails listed in Hong Kong.",
+                    url="https://example.com/supplier",
+                    source="Example",
+                    published_date="2026-07-12",
+                ),
+                SimpleNamespace(
+                    title="Apple stock rises as AAPL services revenue accelerates",
+                    snippet="AAPL shares gained after the latest operating update.",
+                    url="https://example.com/apple",
+                    source="Example",
+                    published_date="2026-07-13",
+                ),
+            ],
+        )
+
+        with patch("src.services.alphasift_service._get_dsa_search_service", return_value=search_service):
+            payload = alphasift_service.search_dsa_stock_news("AAPL", "Apple", max_results=3)
+
+        self.assertEqual([item["url"] for item in payload["results"]], ["https://example.com/apple"])
+        self.assertEqual(
+            [(item["provider"], item["status"]) for item in payload["provider_attempts"]],
+            [("Tavily", "quota_exhausted"), ("SerpAPI", "success")],
+        )
+        self.assertNotIn("secret-value", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(
+            alphasift_service._dsa_news_provider_warnings(payload),
+            ["新闻渠道 Tavily 调用额度已用尽，已按顺序尝试其他可用渠道。"],
+        )
+        search_service.search_stock_news.assert_called_once_with("AAPL", "Apple", max_results=9)
 
     def test_screen_reuses_alphasift_dsa_context_without_refetch(self) -> None:
         config = self._config(enabled=True)

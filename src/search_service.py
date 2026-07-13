@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -141,6 +141,7 @@ class SearchResponse:
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    provider_attempts: List[Dict[str, Any]] = field(default_factory=list)
     
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
@@ -527,6 +528,16 @@ class SerpAPISearchProvider(BaseSearchProvider):
             
             search = GoogleSearch(params)
             response = search.get_dict()
+
+            provider_error = response.get("error")
+            if provider_error:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=str(provider_error),
+                )
             
             # 记录原始响应到日志
             logger.debug(f"[SerpAPI] 原始响应 keys: {response.keys()}")
@@ -3688,6 +3699,7 @@ class SearchService:
             had_provider_success = False
             best_ranked_response: Optional[SearchResponse] = None
             best_ranked_stats: Optional[Dict[str, int]] = None
+            provider_attempts: List[Dict[str, Any]] = []
             for provider in self._providers:
                 if not provider.is_available:
                     continue
@@ -3763,6 +3775,12 @@ class SearchService:
                         ),
                     )
                     if not admitted_count:
+                        provider_attempts.append({
+                            "provider": provider.name,
+                            "status": "no_usable_results",
+                            "result_count": 0,
+                            "message": response.error_message or "过滤后无直接相关的近期新闻",
+                        })
                         logger.info(
                             "%s 搜索成功但准入过滤后无有效新闻，继续尝试下一引擎",
                             provider.name,
@@ -3773,6 +3791,17 @@ class SearchService:
                         limited_response,
                         prefer_chinese=prefer_chinese,
                     )
+                    provider_attempts.append({
+                        "provider": provider.name,
+                        "status": "success" if stats["direct_count"] > 0 else "indirect_only",
+                        "result_count": admitted_count,
+                        "direct_count": stats["direct_count"],
+                        "message": (
+                            f"找到 {stats['direct_count']} 条直接相关新闻"
+                            if stats["direct_count"] > 0
+                            else "仅找到间接关联新闻"
+                        ),
+                    })
                     if self._is_better_ranked_news_response(
                         limited_response,
                         candidate_stats=stats,
@@ -3791,6 +3820,7 @@ class SearchService:
                             provider.name,
                             stats["direct_count"],
                         )
+                        limited_response.provider_attempts = [dict(item) for item in provider_attempts]
                         self._put_cache(cache_key, limited_response)
                         return limited_response
 
@@ -3823,6 +3853,17 @@ class SearchService:
                         )
                 else:
                     filtered_count = len(filtered_response.results or []) if filtered_response.success else 0
+                    attempt_status = (
+                        "no_usable_results"
+                        if response.success
+                        else self._classify_news_provider_failure(response.error_message)
+                    )
+                    provider_attempts.append({
+                        "provider": provider.name,
+                        "status": attempt_status,
+                        "result_count": filtered_count,
+                        "message": response.error_message or "过滤后无有效新闻",
+                    })
                     self._record_news_search_run(
                         provider=provider.name,
                         operation="search_stock_news",
@@ -3847,29 +3888,68 @@ class SearchService:
                         )
 
             if best_ranked_response is not None:
+                best_ranked_response.provider_attempts = [dict(item) for item in provider_attempts]
                 self._put_cache(cache_key, best_ranked_response)
                 return best_ranked_response
 
             if had_provider_success:
-                return SearchResponse(
+                filtered = SearchResponse(
                     query=query,
                     results=[],
                     provider="Filtered",
                     success=True,
                     error_message=None,
                 )
+                filtered.provider_attempts = [dict(item) for item in provider_attempts]
+                return filtered
             
             # 所有引擎都失败
-            return SearchResponse(
+            failed = SearchResponse(
                 query=query,
                 results=[],
                 provider="None",
                 success=False,
                 error_message="所有搜索引擎都不可用或搜索失败"
             )
+            failed.provider_attempts = [dict(item) for item in provider_attempts]
+            return failed
         finally:
             if cache_owner and cache_event is not None:
                 self._release_cache_fill(cache_key, cache_event)
+
+    @staticmethod
+    def _classify_news_provider_failure(error_message: Any) -> str:
+        text = str(error_message or "").lower()
+        quota_tokens = (
+            "quota",
+            "配额",
+            "余额不足",
+            "次数已用尽",
+            "credit exhausted",
+            "credits exhausted",
+            "no credits",
+            "insufficient balance",
+            "usage limit",
+            "monthly limit",
+            "plan limit",
+            "subscription limit",
+            "run out of searches",
+            "out of searches",
+        )
+        if any(token in text for token in quota_tokens):
+            return "quota_exhausted"
+        rate_limit_tokens = (
+            "rate limit",
+            "rate_limit",
+            "rate exceeded",
+            "too many requests",
+            "429",
+            "限流",
+            "频率达到限制",
+        )
+        if any(token in text for token in rate_limit_tokens):
+            return "rate_limited"
+        return "failed"
     
     def search_stock_events(
         self,

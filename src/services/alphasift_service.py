@@ -1284,7 +1284,10 @@ class AlphaSiftService:
             "llm_portfolio_risk": raw_data.get("llm_portfolio_risk") or "",
             "llm_coverage": raw_data.get("llm_coverage"),
             "llm_parse_errors": _list_text_values(raw_data.get("llm_parse_errors")),
-            "warnings": _list_text_values(raw_data.get("warnings")),
+            "warnings": _dedupe_strings([
+                *_list_text_values(raw_data.get("warnings")),
+                *_dsa_enrichment_news_provider_warnings(dsa_enrichment),
+            ]),
             "source_errors": _list_text_values(raw_data.get("source_errors")),
             "dsa_enrichment": dsa_enrichment,
             "deep_analysis_requested": raw_data.get("deep_analysis_requested"),
@@ -1988,7 +1991,10 @@ def _screen_dsa_us(*, strategy: str, config: Config, max_results: int) -> Dict[s
         "llm_portfolio_risk": "",
         "llm_coverage": 0,
         "llm_parse_errors": [],
-        "warnings": warnings,
+        "warnings": _dedupe_strings([
+            *warnings,
+            *_dsa_enrichment_news_provider_warnings(dsa_enrichment),
+        ]),
         "source_errors": _dedupe_strings(source_errors),
         "dsa_enrichment": dsa_enrichment,
         "deep_analysis_requested": False,
@@ -5491,27 +5497,104 @@ def search_dsa_stock_news(stock_code: str, stock_name: str = "", max_results: in
             "results": [],
         }
 
-    response = service.search_stock_news(stock_code, stock_name or stock_code, max_results=max_results)
-    results = []
-    for item in getattr(response, "results", []) or []:
-        results.append(
+    requested_results = max(max_results, min(12, max_results * 3))
+    response = service.search_stock_news(stock_code, stock_name or stock_code, max_results=requested_results)
+    safe_error = redact_diagnostic_text(_env_text(getattr(response, "error_message", None)), limit=200) or None
+    provider_attempts = []
+    for item in getattr(response, "provider_attempts", []) or []:
+        if not isinstance(item, dict):
+            continue
+        provider_attempts.append(
             {
-                "title": getattr(item, "title", ""),
-                "snippet": getattr(item, "snippet", ""),
-                "url": getattr(item, "url", ""),
-                "source": getattr(item, "source", ""),
-                "published_date": getattr(item, "published_date", None),
+                "provider": _env_text(item.get("provider")) or "未知渠道",
+                "status": _env_text(item.get("status")) or "failed",
+                "result_count": int(_safe_float(item.get("result_count")) or 0),
+                "direct_count": int(_safe_float(item.get("direct_count")) or 0),
+                "message": redact_diagnostic_text(_env_text(item.get("message")), limit=160),
             }
         )
+    results = []
+    for item in getattr(response, "results", []) or []:
+        normalized = {
+            "title": getattr(item, "title", ""),
+            "snippet": getattr(item, "snippet", ""),
+            "url": getattr(item, "url", ""),
+            "source": getattr(item, "source", ""),
+            "published_date": getattr(item, "published_date", None),
+        }
+        if not _is_relevant_recent_dsa_stock_news(normalized, stock_code=stock_code, stock_name=stock_name):
+            continue
+        results.append(normalized)
+        if len(results) >= max_results:
+            break
     return _remove_non_finite_json_values(
         {
             "query": getattr(response, "query", ""),
             "provider": getattr(response, "provider", ""),
             "success": bool(getattr(response, "success", False)),
-            "error": getattr(response, "error_message", None),
+            "error": safe_error,
+            "provider_attempts": provider_attempts,
             "results": results,
         }
     )
+
+
+def _is_relevant_recent_dsa_stock_news(
+    item: Dict[str, Any],
+    *,
+    stock_code: str,
+    stock_name: str,
+) -> bool:
+    title = _env_text(item.get("title"))
+    snippet = _env_text(item.get("snippet"))
+    if not title:
+        return False
+
+    code = _normalize_us_screen_symbol(stock_code)
+    if not code:
+        return True
+    code_pattern = rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])"
+    has_ticker = bool(re.search(code_pattern, f"{title} {snippet}".upper()))
+    relationship_title = bool(re.search(
+        r"\b(supply chain|supplier|partner|customer|coattails|exposure to)\b",
+        title,
+        flags=re.I,
+    ))
+    if relationship_title and not has_ticker:
+        return False
+
+    name = _env_text(stock_name)
+    has_name = bool(name and name.upper() != code and name.lower() in f"{title} {snippet}".lower())
+    return has_ticker or has_name
+
+
+def _dsa_news_provider_warnings(news: Dict[str, Any]) -> List[str]:
+    labels = {
+        "quota_exhausted": "调用额度已用尽",
+        "rate_limited": "当前触发限流",
+        "failed": "本次请求失败",
+        "no_usable_results": "未找到近期限内可用新闻",
+        "indirect_only": "仅找到间接关联新闻",
+    }
+    warnings: List[str] = []
+    for attempt in news.get("provider_attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        status = _env_text(attempt.get("status"))
+        label = labels.get(status)
+        if not label:
+            continue
+        provider = _env_text(attempt.get("provider")) or "未知渠道"
+        warnings.append(f"新闻渠道 {provider} {label}，已按顺序尝试其他可用渠道。")
+    return _dedupe_strings(warnings)
+
+
+def _dsa_enrichment_news_provider_warnings(enrichment: Dict[str, Any]) -> List[str]:
+    return [
+        warning
+        for warning in enrichment.get("warnings") or []
+        if _env_text(warning).startswith("新闻渠道 ")
+    ]
 
 
 def get_dsa_candidate_context(
@@ -5674,6 +5757,7 @@ def _build_dsa_candidate_context(
         if not _news_has_results(news):
             try:
                 news = search_dsa_stock_news(code, _env_text(candidate.get("name")) or name or code, max_results=3)
+                warnings.extend(_dsa_news_provider_warnings(news))
                 if not news.get("success"):
                     warnings.append(news.get("error") or "stock_news_unavailable")
             except Exception as exc:  # noqa: BLE001

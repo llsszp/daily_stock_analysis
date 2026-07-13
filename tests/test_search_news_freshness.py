@@ -164,6 +164,54 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         p1.search.assert_called_once()
         p2.search.assert_called_once()
 
+    def test_search_stock_news_exposes_quota_fallback_attempts(self) -> None:
+        fresh = datetime.now().date().isoformat()
+        service = SearchService(
+            bocha_keys=["dummy_key"],
+            searxng_public_instances_enabled=False,
+            news_max_age_days=3,
+            news_strategy_profile="short",
+        )
+        quota_response = SearchResponse(
+            query="Apple AAPL stock latest news",
+            results=[],
+            provider="Tavily",
+            success=False,
+            error_message="Monthly quota exceeded",
+        )
+        success_response = SearchResponse(
+            query="Apple AAPL stock latest news",
+            results=[_result("Apple AAPL earnings update", fresh)],
+            provider="SerpAPI",
+            success=True,
+        )
+        service._providers = [
+            SimpleNamespace(is_available=True, name="Tavily", search=MagicMock(return_value=quota_response)),
+            SimpleNamespace(is_available=True, name="SerpAPI", search=MagicMock(return_value=success_response)),
+        ]
+
+        response = service.search_stock_news("AAPL", "Apple", max_results=3)
+
+        self.assertEqual([item.title for item in response.results], ["Apple AAPL earnings update"])
+        self.assertEqual(
+            [(item["provider"], item["status"]) for item in response.provider_attempts],
+            [("Tavily", "quota_exhausted"), ("SerpAPI", "success")],
+        )
+
+    def test_news_provider_failure_classification_distinguishes_rate_limit(self) -> None:
+        self.assertEqual(
+            SearchService._classify_news_provider_failure("429 Too Many Requests"),
+            "rate_limited",
+        )
+        self.assertEqual(
+            SearchService._classify_news_provider_failure("请求频率达到限制"),
+            "rate_limited",
+        )
+        self.assertEqual(
+            SearchService._classify_news_provider_failure("connection reset"),
+            "failed",
+        )
+
     def test_search_stock_news_records_provider_diagnostics_for_fallback(self) -> None:
         """News search provider attempts should appear in run-flow diagnostics."""
         today = datetime.now().date()

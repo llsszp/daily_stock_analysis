@@ -41,6 +41,19 @@ def _fake_serpapi_module() -> ModuleType:
 
 
 class TestSerpAPISearchProvider(unittest.TestCase):
+    @patch("serpapi.GoogleSearch")
+    def test_provider_error_payload_is_returned_as_failure(self, google_search_cls):
+        google_search_cls.return_value.get_dict.return_value = {
+            "error": "Your account has run out of searches.",
+        }
+        provider = SerpAPISearchProvider(["dummy_key"])
+
+        response = provider.search("Apple AAPL stock latest news", max_results=3, days=3)
+
+        self.assertFalse(response.success)
+        self.assertEqual(response.results, [])
+        self.assertIn("run out of searches", response.error_message or "")
+
     """Tests for provider-specific organic content fetch behavior."""
 
     def _patch_serpapi(self, payload):
