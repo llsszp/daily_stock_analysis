@@ -844,6 +844,11 @@ class AgentExecutor:
             # Inject pre-fetched context data to avoid redundant fetches
             if context.get("realtime_quote"):
                 parts.append(f"\n[系统已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)}")
+            if context.get("recent_intraday_price_action"):
+                parts.append(
+                    "\n[系统已获取的最近24小时价格走势]\n"
+                    f"{json.dumps(context['recent_intraday_price_action'], ensure_ascii=False)}"
+                )
             if context.get("chip_distribution"):
                 parts.append(f"\n[系统已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)}")
             if context.get("news_context"):

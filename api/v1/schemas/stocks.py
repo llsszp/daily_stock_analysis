@@ -28,6 +28,8 @@ class StockQuote(BaseModel):
     prev_close: Optional[float] = Field(None, description="昨收价")
     volume: Optional[float] = Field(None, description="成交量（股）")
     amount: Optional[float] = Field(None, description="成交额（元）")
+    provider_timestamp: Optional[str] = Field(None, description="行情源时间")
+    market_session: Optional[str] = Field(None, description="行情时段")
     update_time: Optional[str] = Field(None, description="更新时间")
     
     model_config = ConfigDict(json_schema_extra={
@@ -43,6 +45,8 @@ class StockQuote(BaseModel):
             "prev_close": 1785.00,
             "volume": 10000000,
             "amount": 18000000000,
+            "provider_timestamp": "2024-01-01T15:00:00+00:00",
+            "market_session": "regular",
             "update_time": "2024-01-01T15:00:00"
         }
     })

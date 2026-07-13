@@ -16,6 +16,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
 import litellm
@@ -172,15 +173,39 @@ def _today_looks_complete_daily_bar(
     return True
 
 
+def _realtime_market_session(context: Dict[str, Any]) -> str:
+    for key in ("realtime", "today"):
+        payload = context.get(key)
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get("market_session") or payload.get("marketSession")
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _market_session_price_label(market_session: str) -> str:
+    return {
+        "pre_market": "盘前实时价",
+        "post_market": "盘后实时价",
+        "overnight": "夜盘实时价",
+        "regular": "当前实时价",
+    }.get(str(market_session or "").strip(), "实时估算价")
+
+
 def _phase_aware_quote_labels(context: Dict[str, Any]) -> Tuple[str, str]:
     """Choose Chinese quote-table labels that do not conflict with phase context."""
+    today = context.get("today")
+    market_session = _realtime_market_session(context)
+    if _today_has_realtime_overlay(today) and market_session:
+        return "最新行情", _market_session_price_label(market_session)
+
     phase_context = context.get("market_phase_context")
     if not isinstance(phase_context, dict):
         return "今日行情", "收盘价"
 
     phase = str(phase_context.get("phase") or "").strip()
     if phase in {"premarket", "non_trading"}:
-        today = context.get("today")
         if _today_looks_complete_daily_bar(context, phase_context):
             return "上一完整交易日行情", "上一完整交易日收盘价"
         if _today_has_realtime_overlay(today):
@@ -200,6 +225,13 @@ def _phase_aware_quote_labels(context: Dict[str, Any]) -> Tuple[str, str]:
 
 def _should_hide_regular_session_ohlc(context: Dict[str, Any]) -> bool:
     phase_context = context.get("market_phase_context")
+    today = context.get("today")
+    if (
+        _today_has_realtime_overlay(today)
+        and _realtime_market_session(context) in {"pre_market", "post_market", "overnight"}
+    ):
+        return True
+
     if not isinstance(phase_context, dict):
         return False
 
@@ -3722,6 +3754,15 @@ class GeminiAnalyzer:
             ]
         )
         quote_rows_text = "\n".join(quote_rows)
+        quote_note_text = ""
+        if _today_has_realtime_overlay(today):
+            quote_note_lines = [
+                "> 注：上表第一行来自实时行情覆盖，不是完整交易日收盘价；生成结论时不得把该价格称为“收盘价”。"
+            ]
+            realtime_session = _realtime_market_session(context)
+            if realtime_session:
+                quote_note_lines.append(f"> 实时行情时段：{realtime_session}。")
+            quote_note_text = "\n".join(quote_note_lines) + "\n"
         
         # ========== 构建决策仪表盘格式的输入 ==========
         prompt = f"""# 决策仪表盘分析请求
@@ -3755,6 +3796,7 @@ class GeminiAnalyzer:
 | 指标 | 数值 |
 |------|------|
 {quote_rows_text}
+{quote_note_text}
 
 ### 均线系统（关键判断指标）
 | 均线 | 数值 | 说明 |
@@ -3773,6 +3815,7 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 解读 |
 |------|------|------|
 | 当前价格 | {rt.get('price', 'N/A')} 元 | |
+| 行情时段 | {rt.get('market_session', 'N/A')} | 非 regular 表示盘前/盘后/夜盘实时行情 |
 | **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
 | **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
@@ -3781,6 +3824,13 @@ class GeminiAnalyzer:
 | 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
+
+        recent_intraday_section = self._format_recent_intraday_price_action_prompt(
+            context.get("recent_intraday_price_action"),
+            report_language=report_language,
+        )
+        if recent_intraday_section:
+            prompt += recent_intraday_section
 
         # 添加财报与分红（价值投资口径）
         fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
@@ -4185,6 +4235,122 @@ class GeminiAnalyzer:
             return f"{amount / 1e4:.2f} 万元"
         else:
             return f"{amount:.0f} 元"
+
+    def _format_recent_intraday_price_action_prompt(
+        self,
+        payload: Any,
+        *,
+        report_language: str = "zh",
+    ) -> str:
+        """Render compact 24h intraday/extended-session price action for the LLM."""
+        if not isinstance(payload, dict):
+            return ""
+        summary = payload.get("summary")
+        if not isinstance(summary, dict):
+            return ""
+
+        lang = normalize_report_language(report_language)
+        is_en = lang in ("en", "ko")
+
+        def value_text(value: Any, suffix: str = "") -> str:
+            if value in (None, ""):
+                return "N/A"
+            return f"{value}{suffix}"
+
+        def time_text(value: Any) -> str:
+            if value in (None, ""):
+                return "N/A"
+            text = str(value).strip()
+            try:
+                normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                cn_time = dt.astimezone(timezone(timedelta(hours=8)))
+                return cn_time.strftime("%m-%d %H:%M")
+            except Exception:
+                return text[:16]
+
+        def point_line(point: Dict[str, Any]) -> str:
+            return f"{time_text(point.get('timestamp'))} {value_text(point.get('close'))}"
+
+        sample_points = [
+            point for point in payload.get("sample_points", [])
+            if isinstance(point, dict)
+        ][:18]
+        recent_bars = [
+            point for point in payload.get("recent_bars", [])
+            if isinstance(point, dict)
+        ][-12:]
+        window_changes = summary.get("window_changes")
+        window_changes = window_changes if isinstance(window_changes, dict) else {}
+
+        if is_en:
+            lines = [
+                "",
+                "### Recent 24h Price Action (5-min bars, extended sessions included)",
+                "| Metric | Value |",
+                "|------|------|",
+                f"| Source | {payload.get('source', 'N/A')} / {payload.get('trade_sessions', 'all')} |",
+                f"| Window | {time_text(summary.get('start_time'))} - {time_text(summary.get('end_time'))} (UTC+8) |",
+                f"| Bars | {value_text(summary.get('bar_count'))} x {value_text(summary.get('interval_minutes'))}min |",
+                f"| Start / Last | {value_text(summary.get('start_price'))} -> {value_text(summary.get('last_price'))} |",
+                f"| Change | {value_text(summary.get('change_pct'), '%')} |",
+                f"| High / Low | {value_text(summary.get('high_price'))} @ {time_text(summary.get('high_time'))} / {value_text(summary.get('low_price'))} @ {time_text(summary.get('low_time'))} |",
+                f"| Range | {value_text(summary.get('range_pct'), '%')} |",
+                f"| From High / From Low | {value_text(summary.get('drawdown_from_high_pct'), '%')} / {value_text(summary.get('rebound_from_low_pct'), '%')} |",
+                f"| Trend Label | {value_text(summary.get('trend_label'))} |",
+            ]
+            if window_changes:
+                changes = []
+                for key in ("1h", "4h", "12h", "24h"):
+                    item = window_changes.get(key)
+                    if isinstance(item, dict):
+                        changes.append(f"{key}: {value_text(item.get('change_pct'), '%')}")
+                if changes:
+                    lines.append(f"- Window changes: {'; '.join(changes)}")
+            if sample_points:
+                lines.append(f"- Sample path: {' -> '.join(point_line(p) for p in sample_points)}")
+            if recent_bars:
+                lines.append(f"- Last hour path: {' -> '.join(point_line(p) for p in recent_bars)}")
+            lines.append(
+                "- Use this as near-term state evidence. Extended-session volume can be thin; "
+                "distinguish overnight/pre/post-market moves from regular-session confirmation."
+            )
+            return "\n".join(lines) + "\n"
+
+        lines = [
+            "",
+            "### 最近24小时价格走势（5分钟K线，含盘前/盘后/夜盘）",
+            "| 指标 | 数值 |",
+            "|------|------|",
+            f"| 数据源 | {payload.get('source', 'N/A')} / {payload.get('trade_sessions', 'all')} |",
+            f"| 时间范围 | {time_text(summary.get('start_time'))} - {time_text(summary.get('end_time'))}（北京时间） |",
+            f"| K线数量 | {value_text(summary.get('bar_count'))} 根，每根 {value_text(summary.get('interval_minutes'))} 分钟 |",
+            f"| 起点/最新 | {value_text(summary.get('start_price'))} -> {value_text(summary.get('last_price'))} |",
+            f"| 24小时涨跌 | {value_text(summary.get('change_pct'), '%')} |",
+            f"| 最高/最低 | {value_text(summary.get('high_price'))} @ {time_text(summary.get('high_time'))} / {value_text(summary.get('low_price'))} @ {time_text(summary.get('low_time'))} |",
+            f"| 区间振幅 | {value_text(summary.get('range_pct'), '%')} |",
+            f"| 距高点/较低点 | {value_text(summary.get('drawdown_from_high_pct'), '%')} / {value_text(summary.get('rebound_from_low_pct'), '%')} |",
+            f"| 短线形态标签 | {value_text(summary.get('trend_label'))} |",
+        ]
+        if window_changes:
+            changes = []
+            for key in ("1h", "4h", "12h", "24h"):
+                item = window_changes.get(key)
+                if isinstance(item, dict):
+                    changes.append(f"{key}: {value_text(item.get('change_pct'), '%')}")
+            if changes:
+                lines.append(f"- 分段涨跌：{'; '.join(changes)}")
+        if sample_points:
+            lines.append(f"- 24小时抽样路径：{' -> '.join(point_line(p) for p in sample_points)}")
+        if recent_bars:
+            lines.append(f"- 最近约1小时路径：{' -> '.join(point_line(p) for p in recent_bars)}")
+        lines.append(
+            "- 分析要求：把这段走势作为当前短线状态证据；扩展交易时段成交可能偏薄，"
+            "需要区分夜盘/盘前/盘后波动与正常交易时段确认。"
+        )
+        return "\n".join(lines) + "\n"
 
     def _format_percent(self, value: Optional[float]) -> str:
         """格式化百分比显示"""

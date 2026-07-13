@@ -1,0 +1,75 @@
+{
+  "charts": [
+    {
+      "id": "candidate-quality-checks",
+      "height": 360,
+      "type": "bar",
+      "dataset": {
+        "id": "candidate-quality-checks",
+        "title": "候选结果质量检查",
+        "data": [
+          {
+            "check": "显示为低风险",
+            "count": 10,
+            "denominator": 10,
+            "detail": "risk_level=low"
+          },
+          {
+            "check": "来自固定默认列表",
+            "count": 7,
+            "denominator": 10,
+            "detail": "returned code matched DSA_US_DEFAULT_UNIVERSE"
+          },
+          {
+            "check": "半导体候选",
+            "count": 5,
+            "denominator": 10,
+            "detail": "TSM, AMD, NVDA, AVGO, MU"
+          },
+          {
+            "check": "ETF",
+            "count": 2,
+            "denominator": 10,
+            "detail": "SPY, QQQ"
+          },
+          {
+            "check": "日线不足仍入选",
+            "count": 1,
+            "denominator": 10,
+            "detail": "SPCX daily calibration unavailable with 18 bars"
+          },
+          {
+            "check": "符合近期回踩区间",
+            "count": 0,
+            "denominator": 10,
+            "detail": "change_5d_pct between -8 and -1"
+          }
+        ],
+        "chart_spec": {
+          "id": "candidate-quality-checks",
+          "dataset": "candidate-quality-checks",
+          "title": "候选结果质量检查",
+          "type": "bar",
+          "encodings": {
+            "x": {
+              "field": "check",
+              "type": "nominal"
+            },
+            "y": {
+              "field": "count",
+              "label": "候选数量",
+              "type": "quantitative"
+            }
+          },
+          "settings": {
+            "orientation": "horizontal",
+            "groupMode": "grouped"
+          },
+          "xAxisTitle": "",
+          "yAxisTitle": "候选数量",
+          "valueFormat": "number"
+        }
+      }
+    }
+  ]
+}

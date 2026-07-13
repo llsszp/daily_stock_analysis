@@ -90,6 +90,7 @@ class AnalysisContextBuilder:
         blocks["daily_bars"] = _build_daily_bars_block(artifacts)
         technical_block, technical_warnings = _build_technical_block(artifacts)
         blocks["technical"] = technical_block
+        blocks["recent_intraday"] = _build_recent_intraday_block(artifacts)
         data_quality_warnings.extend(technical_warnings)
         blocks["chip"] = _build_chip_block(artifacts)
         blocks["fundamentals"] = _build_fundamentals_block(artifacts)
@@ -311,6 +312,66 @@ def _build_technical_block(
             },
         ),
         warnings,
+    )
+
+
+def _build_recent_intraday_block(artifacts: PipelineAnalysisArtifacts) -> AnalysisContextBlock:
+    context = _to_dict((artifacts.enhanced_context or {}).get("recent_intraday_price_action"))
+    if not context:
+        return AnalysisContextBlock(
+            status=ContextFieldStatus.MISSING,
+            items={
+                "recent_intraday_price_action": AnalysisContextItem(
+                    status=ContextFieldStatus.MISSING,
+                    missing_reason="recent_intraday_price_action_missing",
+                )
+            },
+            metadata={"auxiliary": True, "quality_weighted": False},
+        )
+
+    summary = context.get("summary")
+    summary = summary if isinstance(summary, Mapping) else {}
+    source = _source_text(context.get("source")) or "LongbridgeFetcher"
+    timestamp = _metadata_iso_datetime_value(context, "end_time") or _metadata_iso_datetime_value(
+        summary,
+        "end_time",
+    )
+    items: Dict[str, AnalysisContextItem] = {
+        "summary": AnalysisContextItem(
+            status=ContextFieldStatus.AVAILABLE,
+            value=dict(summary) if isinstance(summary, Mapping) else None,
+            source=source,
+            timestamp=timestamp,
+        )
+    }
+    for key in ("sample_points", "recent_bars"):
+        value = context.get(key)
+        if value:
+            items[key] = AnalysisContextItem(
+                status=ContextFieldStatus.AVAILABLE,
+                value=value,
+                source=source,
+                timestamp=timestamp,
+            )
+
+    return AnalysisContextBlock(
+        status=ContextFieldStatus.AVAILABLE,
+        items=items,
+        source=source,
+        timestamp=timestamp,
+        metadata={
+            key: value
+            for key, value in {
+                "hours": context.get("hours") or summary.get("hours"),
+                "interval_minutes": context.get("interval_minutes")
+                or summary.get("interval_minutes"),
+                "bar_count": context.get("bar_count") or summary.get("bar_count"),
+                "trade_sessions": context.get("trade_sessions"),
+                "auxiliary": True,
+                "quality_weighted": False,
+            }.items()
+            if value is not None
+        },
     )
 
 

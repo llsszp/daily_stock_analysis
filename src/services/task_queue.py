@@ -118,7 +118,7 @@ class TaskInfo:
             status=self.status,
             progress=self.progress,
             message=self.message,
-            result=self.result,
+            result=copy.deepcopy(self.result),
             error=self.error,
             report_type=self.report_type,
             analysis_phase=self.analysis_phase,
@@ -654,6 +654,30 @@ class AnalysisTaskQueue:
             task_snapshot = task.copy()
 
         self._broadcast_event(event_type, task_snapshot.to_dict())
+        return task_snapshot
+
+    def update_task_partial_result(
+        self,
+        task_id: str,
+        result: Dict[str, Any],
+        *,
+        progress: Optional[int] = None,
+        message: Optional[str] = None,
+    ) -> Optional[TaskInfo]:
+        """Publish an in-flight result snapshot for progressively rendered tasks."""
+        with self._data_lock:
+            task = self._tasks.get(task_id)
+            if not task or task.status not in (TaskStatus.PENDING, TaskStatus.PROCESSING):
+                return None
+
+            task.result = copy.deepcopy(result)
+            if progress is not None:
+                task.progress = max(task.progress, max(0, min(99, int(progress))))
+            if message is not None:
+                task.message = message
+            task_snapshot = task.copy()
+
+        self._broadcast_event("task_progress", task_snapshot.to_dict())
         return task_snapshot
     
     # ========== 任务执行 ==========

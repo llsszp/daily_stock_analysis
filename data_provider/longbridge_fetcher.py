@@ -24,12 +24,13 @@ import base64
 import binascii
 import json
 import logging
+import math
 import os
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import pandas as pd
 
@@ -40,7 +41,11 @@ from .us_index_mapping import is_us_stock_code, is_us_index_code
 logger = logging.getLogger(__name__)
 
 _DEFAULT_STATIC_INFO_TTL = 86400  # 24h
+_DEFAULT_QUOTE_CACHE_TTL_SECONDS = 15
 _DEFAULT_CONNECTION_COOLDOWN_SECONDS = 15
+_DEFAULT_RECENT_INTRADAY_HOURS = 24
+_DEFAULT_RECENT_INTRADAY_INTERVAL_MINUTES = 5
+_LONGBRIDGE_TIMESTAMP_TZ = timezone(timedelta(hours=8))
 
 
 def _static_info_ttl_seconds() -> int:
@@ -52,6 +57,16 @@ def _static_info_ttl_seconds() -> int:
         return max(0, int(raw))
     except ValueError:
         return _DEFAULT_STATIC_INFO_TTL
+
+
+def _quote_cache_ttl_seconds() -> int:
+    raw = os.getenv("LONGBRIDGE_QUOTE_CACHE_TTL_SECONDS", "").strip()
+    if raw == "":
+        return _DEFAULT_QUOTE_CACHE_TTL_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_QUOTE_CACHE_TTL_SECONDS
 
 
 def _connection_cooldown_seconds() -> int:
@@ -403,6 +418,228 @@ def _to_longbridge_symbol(stock_code: str) -> Optional[str]:
     return None
 
 
+def _coerce_quote_timestamp(value: Any) -> Optional[datetime]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_LONGBRIDGE_TIMESTAMP_TZ)
+    return parsed.astimezone(timezone.utc)
+
+
+def _select_latest_us_quote(q: Any) -> Dict[str, Any]:
+    """Pick the latest available US regular/pre/post/overnight quote payload."""
+    regular_price = safe_float(getattr(q, "last_done", None))
+    candidates = []
+    if regular_price is not None and regular_price > 0:
+        candidates.append({
+            "session": "regular",
+            "payload": q,
+            "price": regular_price,
+            "timestamp": _coerce_quote_timestamp(getattr(q, "timestamp", None)),
+        })
+
+    for session, attr in (
+        ("pre_market", "pre_market_quote"),
+        ("post_market", "post_market_quote"),
+        ("overnight", "overnight_quote"),
+    ):
+        payload = getattr(q, attr, None)
+        if payload is None:
+            continue
+        price = safe_float(getattr(payload, "last_done", None))
+        if price is None or price <= 0:
+            continue
+        candidates.append({
+            "session": session,
+            "payload": payload,
+            "price": price,
+            "timestamp": _coerce_quote_timestamp(getattr(payload, "timestamp", None)),
+        })
+
+    if not candidates:
+        return {"session": "regular", "payload": q, "price": None, "timestamp": None}
+
+    timestamped = [item for item in candidates if item["timestamp"] is not None]
+    if timestamped:
+        return max(timestamped, key=lambda item: item["timestamp"])
+    return candidates[0]
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _round_float(value: Any, digits: int = 2) -> Optional[float]:
+    number = safe_float(value)
+    if number is None:
+        return None
+    return round(number, digits)
+
+
+def _pct_change(start: Optional[float], end: Optional[float]) -> Optional[float]:
+    if start is None or end is None or start <= 0:
+        return None
+    return round((end - start) / start * 100, 2)
+
+
+def _compact_intraday_points(
+    bars: List[Dict[str, Any]],
+    *,
+    max_points: int = 18,
+) -> List[Dict[str, Any]]:
+    if len(bars) <= max_points:
+        return list(bars)
+    step = max(1, math.ceil(len(bars) / max_points))
+    selected = bars[::step]
+    if selected[-1].get("timestamp") != bars[-1].get("timestamp"):
+        selected.append(bars[-1])
+    return selected[: max_points - 1] + [bars[-1]] if len(selected) > max_points else selected
+
+
+def _window_change_from_bars(
+    bars: List[Dict[str, Any]],
+    *,
+    minutes: int,
+) -> Optional[Dict[str, Any]]:
+    if not bars:
+        return None
+    end_ts = _coerce_quote_timestamp(bars[-1].get("timestamp"))
+    if end_ts is None:
+        return None
+    cutoff = end_ts - timedelta(minutes=minutes)
+    window = [
+        bar for bar in bars
+        if (_coerce_quote_timestamp(bar.get("timestamp")) or end_ts) >= cutoff
+    ]
+    if len(window) < 2:
+        return None
+    start_price = safe_float(window[0].get("open")) or safe_float(window[0].get("close"))
+    end_price = safe_float(window[-1].get("close"))
+    return {
+        "start_time": window[0].get("timestamp"),
+        "end_time": window[-1].get("timestamp"),
+        "start_price": _round_float(start_price, 4),
+        "end_price": _round_float(end_price, 4),
+        "change_pct": _pct_change(start_price, end_price),
+        "bar_count": len(window),
+    }
+
+
+def _summarize_recent_intraday_bars(
+    bars: List[Dict[str, Any]],
+    *,
+    hours: int,
+    interval_minutes: int,
+) -> Optional[Dict[str, Any]]:
+    if not bars:
+        return None
+
+    first = bars[0]
+    last = bars[-1]
+    start_price = safe_float(first.get("open")) or safe_float(first.get("close"))
+    last_price = safe_float(last.get("close"))
+    highs = [
+        (safe_float(bar.get("high")), bar.get("timestamp"))
+        for bar in bars
+        if safe_float(bar.get("high")) is not None
+    ]
+    lows = [
+        (safe_float(bar.get("low")), bar.get("timestamp"))
+        for bar in bars
+        if safe_float(bar.get("low")) is not None
+    ]
+    high_price, high_time = max(highs, key=lambda item: item[0]) if highs else (None, None)
+    low_price, low_time = min(lows, key=lambda item: item[0]) if lows else (None, None)
+    volume_total = sum(_safe_int(bar.get("volume")) or 0 for bar in bars)
+    turnover_values = [_round_float(bar.get("turnover"), 4) for bar in bars]
+    turnover_total = sum(value for value in turnover_values if value is not None)
+    vwap = (
+        round(turnover_total / volume_total, 4)
+        if volume_total > 0 and turnover_total > 0
+        else None
+    )
+    change_pct = _pct_change(start_price, last_price)
+    range_pct = (
+        round((high_price - low_price) / start_price * 100, 2)
+        if start_price and start_price > 0 and high_price is not None and low_price is not None
+        else None
+    )
+    drawdown_from_high_pct = (
+        round((last_price - high_price) / high_price * 100, 2)
+        if last_price is not None and high_price and high_price > 0
+        else None
+    )
+    rebound_from_low_pct = (
+        round((last_price - low_price) / low_price * 100, 2)
+        if last_price is not None and low_price and low_price > 0
+        else None
+    )
+
+    if change_pct is None:
+        trend_label = "unknown"
+    elif change_pct >= 2:
+        trend_label = "strong_up"
+    elif change_pct >= 0.5:
+        trend_label = "up"
+    elif change_pct <= -2:
+        trend_label = "strong_down"
+    elif change_pct <= -0.5:
+        trend_label = "down"
+    elif range_pct is not None and range_pct >= 2:
+        trend_label = "range_bound"
+    else:
+        trend_label = "flat"
+
+    return {
+        "hours": int(hours),
+        "interval_minutes": int(interval_minutes),
+        "bar_count": len(bars),
+        "start_time": first.get("timestamp"),
+        "end_time": last.get("timestamp"),
+        "start_price": _round_float(start_price, 4),
+        "last_price": _round_float(last_price, 4),
+        "high_price": _round_float(high_price, 4),
+        "high_time": high_time,
+        "low_price": _round_float(low_price, 4),
+        "low_time": low_time,
+        "change_pct": change_pct,
+        "range_pct": range_pct,
+        "drawdown_from_high_pct": drawdown_from_high_pct,
+        "rebound_from_low_pct": rebound_from_low_pct,
+        "volume_total": volume_total if volume_total > 0 else None,
+        "turnover_total": round(turnover_total, 2) if turnover_total > 0 else None,
+        "vwap": vwap,
+        "trend_label": trend_label,
+        "window_changes": {
+            key: value
+            for key, value in {
+                "1h": _window_change_from_bars(bars, minutes=60),
+                "4h": _window_change_from_bars(bars, minutes=240),
+                "12h": _window_change_from_bars(bars, minutes=720),
+                "24h": _window_change_from_bars(bars, minutes=1440),
+            }.items()
+            if value is not None
+        },
+    }
+
+
 class LongbridgeFetcher(BaseFetcher):
     """
     长桥 OpenAPI 数据源实现
@@ -430,6 +667,8 @@ class LongbridgeFetcher(BaseFetcher):
         # {symbol: (StaticInfo, timestamp)}
         self._static_cache: Dict[str, Any] = {}
         self._static_cache_lock = threading.Lock()
+        self._quote_cache: Dict[str, Any] = {}
+        self._quote_cache_lock = threading.Lock()
 
     def _is_connection_error(self, exc: Exception) -> bool:
         msg = str(exc).lower()
@@ -650,6 +889,73 @@ class LongbridgeFetcher(BaseFetcher):
                 self._mark_connection_cooldown(e)
         return None
 
+    def _get_cached_quote(self, symbol: str) -> Optional[Any]:
+        ttl = _quote_cache_ttl_seconds()
+        if ttl <= 0:
+            return None
+        with self._quote_cache_lock:
+            cached = self._quote_cache.get(symbol)
+            if cached and time.time() - cached[1] <= ttl:
+                return cached[0]
+        return None
+
+    def _cache_quotes(self, quotes: List[Any], symbols: List[str]) -> int:
+        now = time.time()
+        cached_count = 0
+        with self._quote_cache_lock:
+            for index, quote in enumerate(quotes):
+                raw_symbol = getattr(quote, "symbol", None)
+                symbol = str(raw_symbol).strip().upper() if isinstance(raw_symbol, str) else ""
+                if symbol not in symbols and index < len(symbols):
+                    symbol = symbols[index]
+                if not symbol:
+                    continue
+                self._quote_cache[symbol] = (quote, now)
+                cached_count += 1
+        return cached_count
+
+    def prefetch_realtime_quotes(self, stock_codes: List[str], *, batch_size: int = 50) -> int:
+        """Batch-fetch raw quotes and static metadata for immediate per-symbol reuse."""
+        if not self.is_available_for_request("realtime_quote_prefetch"):
+            return 0
+        symbols = []
+        for code in stock_codes:
+            symbol = _to_longbridge_symbol(code)
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+        if not symbols:
+            return 0
+        ctx = self._get_ctx()
+        if ctx is None:
+            return 0
+
+        batch_size = max(1, min(int(batch_size or 50), 100))
+        cached_count = 0
+        for offset in range(0, len(symbols), batch_size):
+            batch = symbols[offset:offset + batch_size]
+            try:
+                quotes = list(ctx.quote(batch) or [])
+                cached_count += self._cache_quotes(quotes, batch)
+            except Exception as exc:
+                logger.info("[Longbridge] 批量 quote(%s只) 失败: %s", len(batch), exc)
+                if self._is_connection_error(exc):
+                    self._mark_connection_cooldown(exc)
+                break
+            try:
+                infos = list(ctx.static_info(batch) or [])
+                now = time.time()
+                with self._static_cache_lock:
+                    for index, info in enumerate(infos):
+                        raw_symbol = getattr(info, "symbol", None)
+                        symbol = str(raw_symbol).strip().upper() if isinstance(raw_symbol, str) else ""
+                        if symbol not in batch and index < len(batch):
+                            symbol = batch[index]
+                        if symbol:
+                            self._static_cache[symbol] = (info, now)
+            except Exception as exc:
+                logger.debug("[Longbridge] 批量 static_info(%s只) 失败: %s", len(batch), exc)
+        return cached_count
+
     # ------------------------------------------------------------------
     # get_stock_name via static_info
     # ------------------------------------------------------------------
@@ -727,7 +1033,12 @@ class LongbridgeFetcher(BaseFetcher):
     # get_realtime_quote
     # ------------------------------------------------------------------
 
-    def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        include_volume_ratio: bool = True,
+    ) -> Optional[UnifiedRealtimeQuote]:
         """Fetch realtime quote from Longbridge, computing derived fields."""
         if not self.is_available_for_request("realtime_quote"):
             return None
@@ -741,27 +1052,38 @@ class LongbridgeFetcher(BaseFetcher):
         if ctx is None:
             return None
 
-        try:
-            quotes = ctx.quote([symbol])
-            if not quotes:
+        q = self._get_cached_quote(symbol)
+        if q is None:
+            try:
+                quotes = ctx.quote([symbol])
+                if not quotes:
+                    return None
+                q = quotes[0]
+                self._cache_quotes([q], [symbol])
+            except Exception as e:
+                logger.info(f"[Longbridge] quote({symbol}) 失败: {e}")
+                if self._is_connection_error(e):
+                    self._mark_connection_cooldown(e)
                 return None
-            q = quotes[0]
-        except Exception as e:
-            logger.info(f"[Longbridge] quote({symbol}) 失败: {e}")
-            if self._is_connection_error(e):
-                self._mark_connection_cooldown(e)
-            return None
 
-        price = safe_float(getattr(q, "last_done", None))
+        selected_quote = _select_latest_us_quote(q) if symbol.endswith(".US") else {
+            "session": "regular",
+            "payload": q,
+            "price": safe_float(getattr(q, "last_done", None)),
+            "timestamp": _coerce_quote_timestamp(getattr(q, "timestamp", None)),
+        }
+        quote_payload = selected_quote["payload"]
+        market_session = selected_quote["session"]
+        price = selected_quote["price"]
         if price is None or price <= 0:
             return None
 
-        prev_close = safe_float(getattr(q, "prev_close", None))
+        prev_close = safe_float(getattr(quote_payload, "prev_close", None))
         open_price = safe_float(getattr(q, "open", None))
-        high = safe_float(getattr(q, "high", None))
-        low = safe_float(getattr(q, "low", None))
-        volume = int(getattr(q, "volume", 0) or 0)
-        turnover = safe_float(getattr(q, "turnover", None))
+        high = safe_float(getattr(quote_payload, "high", None))
+        low = safe_float(getattr(quote_payload, "low", None))
+        volume = int(getattr(quote_payload, "volume", 0) or 0)
+        turnover = safe_float(getattr(quote_payload, "turnover", None))
 
         change_amount = None
         change_pct = None
@@ -818,12 +1140,19 @@ class LongbridgeFetcher(BaseFetcher):
             if circulating > 0:
                 circ_mv = round(price * circulating, 2)
 
-        volume_ratio = self._compute_volume_ratio(symbol, volume)
+        volume_ratio = self._compute_volume_ratio(symbol, volume) if include_volume_ratio else None
 
         quote = UnifiedRealtimeQuote(
             code=stock_code,
             name=name,
             source=RealtimeSource.LONGBRIDGE,
+            provider_timestamp=(
+                selected_quote["timestamp"].isoformat()
+                if selected_quote.get("timestamp") is not None
+                else None
+            ),
+            market="us" if symbol.endswith(".US") else "hk" if symbol.endswith(".HK") else None,
+            market_session=market_session,
             price=price,
             change_pct=change_pct,
             change_amount=change_amount,
@@ -844,9 +1173,124 @@ class LongbridgeFetcher(BaseFetcher):
 
         logger.info(
             f"[Longbridge] {symbol} 行情获取成功: "
-            f"价格={price}, 量比={volume_ratio}, 换手率={turnover_rate}"
+            f"价格={price}, 时段={market_session}, 量比={volume_ratio}, 换手率={turnover_rate}"
         )
         return quote
+
+    def get_recent_intraday_price_action(
+        self,
+        stock_code: str,
+        *,
+        hours: int = _DEFAULT_RECENT_INTRADAY_HOURS,
+        interval_minutes: int = _DEFAULT_RECENT_INTRADAY_INTERVAL_MINUTES,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch recent extended-session intraday bars and return a compact summary.
+
+        Longbridge's minute K-line endpoint has per-request count limits, so the
+        default uses 5-minute bars and filters the latest response down to the
+        requested 24-hour window.  For US symbols, ``TradeSessions.All`` includes
+        regular, pre-market, post-market, and overnight sessions when the account
+        has the corresponding data permission and ``LONGBRIDGE_ENABLE_OVERNIGHT``
+        is enabled.
+        """
+        if not self.is_available_for_request("recent_intraday_price_action"):
+            return None
+
+        hours = max(1, min(int(hours or _DEFAULT_RECENT_INTRADAY_HOURS), 72))
+        interval_minutes = int(interval_minutes or _DEFAULT_RECENT_INTRADAY_INTERVAL_MINUTES)
+        if interval_minutes != 5:
+            logger.debug(
+                "[Longbridge] recent intraday only supports 5-minute bars, got %s",
+                interval_minutes,
+            )
+            interval_minutes = 5
+
+        symbol = _to_longbridge_symbol(stock_code)
+        if symbol is None:
+            logger.debug("[Longbridge] 无法转换代码用于24小时走势: %s", stock_code)
+            return None
+
+        ctx = self._get_ctx()
+        if ctx is None:
+            return None
+
+        try:
+            from longbridge.openapi import AdjustType, Period, TradeSessions
+        except Exception as exc:
+            logger.debug("[Longbridge] 当前 SDK 不支持 intraday candlesticks: %s", exc)
+            return None
+
+        count = min(1000, max(60, math.ceil(hours * 60 / interval_minutes) + 12))
+        try:
+            candles = ctx.candlesticks(
+                symbol,
+                Period.Min_5,
+                count,
+                AdjustType.NoAdjust,
+                TradeSessions.All,
+            )
+        except Exception as exc:
+            logger.info("[Longbridge] candlesticks(%s) 最近%s小时走势失败: %s", symbol, hours, exc)
+            if self._is_connection_error(exc):
+                self._mark_connection_cooldown(exc)
+            return None
+
+        if not candles:
+            return None
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        rows: List[Dict[str, Any]] = []
+        for candle in candles:
+            ts = _coerce_quote_timestamp(getattr(candle, "timestamp", None))
+            if ts is None or ts < cutoff:
+                continue
+            close_price = safe_float(getattr(candle, "close", None))
+            if close_price is None or close_price <= 0:
+                continue
+            rows.append({
+                "timestamp": ts.isoformat(),
+                "open": _round_float(getattr(candle, "open", None), 4),
+                "high": _round_float(getattr(candle, "high", None), 4),
+                "low": _round_float(getattr(candle, "low", None), 4),
+                "close": _round_float(close_price, 4),
+                "volume": _safe_int(getattr(candle, "volume", None)),
+                "turnover": _round_float(getattr(candle, "turnover", None), 4),
+            })
+
+        rows = sorted(rows, key=lambda item: item["timestamp"])
+        if not rows:
+            return None
+
+        summary = _summarize_recent_intraday_bars(
+            rows,
+            hours=hours,
+            interval_minutes=interval_minutes,
+        )
+        if not summary:
+            return None
+
+        payload = {
+            "source": self.name,
+            "symbol": symbol,
+            "hours": hours,
+            "interval_minutes": interval_minutes,
+            "trade_sessions": "all",
+            "bar_count": len(rows),
+            "start_time": rows[0]["timestamp"],
+            "end_time": rows[-1]["timestamp"],
+            "summary": summary,
+            "sample_points": _compact_intraday_points(rows, max_points=18),
+            "recent_bars": rows[-12:],
+        }
+        logger.info(
+            "[Longbridge] %s 最近%s小时走势获取成功: %s根%s分钟K线, change=%s%%",
+            symbol,
+            hours,
+            len(rows),
+            interval_minutes,
+            summary.get("change_pct"),
+        )
+        return payload
 
     # ------------------------------------------------------------------
     # BaseFetcher abstract methods (historical daily data)

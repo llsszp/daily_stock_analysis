@@ -419,6 +419,7 @@ class StockAnalysisPipeline:
 
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
             realtime_quote = None
+            recent_intraday_price_action = None
             try:
                 if self.config.enable_realtime_quote:
                     realtime_quote = self.fetcher_manager.get_realtime_quote(code, log_final_failure=False)
@@ -438,6 +439,27 @@ class StockAnalysisPipeline:
                     logger.info(f"{stock_name}({code}) 实时行情已禁用，使用历史收盘价继续分析")
             except Exception as e:
                 logger.warning(f"{stock_name}({code}) 实时行情链路异常，已降级为历史收盘价继续分析: {e}")
+
+            try:
+                if self.config.enable_realtime_quote:
+                    recent_fetch = getattr(self.fetcher_manager, "get_recent_intraday_price_action", None)
+                    if callable(recent_fetch):
+                        recent_intraday_price_action = recent_fetch(
+                            code,
+                            hours=24,
+                            interval_minutes=5,
+                        )
+                        if recent_intraday_price_action:
+                            summary = recent_intraday_price_action.get("summary", {})
+                            logger.info(
+                                "%s(%s) 最近24小时走势: %s根5分钟K线, 涨跌幅=%s%%",
+                                stock_name,
+                                code,
+                                recent_intraday_price_action.get("bar_count"),
+                                summary.get("change_pct"),
+                            )
+            except Exception as e:
+                logger.warning("%s(%s) 最近24小时走势获取失败，继续分析: %s", stock_name, code, e)
 
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
@@ -540,6 +562,7 @@ class StockAnalysisPipeline:
                     chip_data,
                     fundamental_context,
                     trend_result,
+                    recent_intraday_price_action=recent_intraday_price_action,
                     market_phase_context=market_phase_context_dict,
                     market_phase_summary=market_phase_summary,
                     daily_market_context=daily_market_context,
@@ -639,6 +662,7 @@ class StockAnalysisPipeline:
                 trend_result,
                 stock_name,  # 传入股票名称
                 fundamental_context,
+                recent_intraday_price_action=recent_intraday_price_action,
                 market_phase_context=market_phase_context_dict,
                 portfolio_context=portfolio_context,
             )
@@ -844,6 +868,7 @@ class StockAnalysisPipeline:
         trend_result: Optional[TrendAnalysisResult],
         stock_name: str = "",
         fundamental_context: Optional[Dict[str, Any]] = None,
+        recent_intraday_price_action: Optional[Dict[str, Any]] = None,
         market_phase_context: Optional[Dict[str, Any]] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -873,6 +898,8 @@ class StockAnalysisPipeline:
             enhanced['stock_name'] = realtime_quote.name
         if isinstance(portfolio_context, dict):
             enhanced["portfolio_context"] = dict(portfolio_context)
+        if isinstance(recent_intraday_price_action, dict):
+            enhanced["recent_intraday_price_action"] = recent_intraday_price_action
 
         # 将运行时搜索窗口透传给 analyzer，避免与全局配置重新读取产生窗口不一致
         enhanced['news_window_days'] = getattr(self.search_service, "news_window_days", 3)
@@ -897,6 +924,7 @@ class StockAnalysisPipeline:
                 'circ_mv': getattr(realtime_quote, 'circ_mv', None),
                 'change_60d': getattr(realtime_quote, 'change_60d', None),
                 'source': quote_source_name,
+                'market_session': getattr(realtime_quote, 'market_session', None),
                 'fetched_at': getattr(realtime_quote, 'fetched_at', None),
                 'provider_timestamp': getattr(realtime_quote, 'provider_timestamp', None),
                 'is_stale': getattr(realtime_quote, 'is_stale', None),
@@ -959,6 +987,7 @@ class StockAnalysisPipeline:
                 fetched_at = getattr(realtime_quote, 'fetched_at', None)
                 provider_timestamp = getattr(realtime_quote, 'provider_timestamp', None)
                 fallback_from = getattr(realtime_quote, 'fallback_from', None)
+                market_session = getattr(realtime_quote, 'market_session', None)
                 realtime_today = {
                     'close': price,
                     'open': open_p,
@@ -993,6 +1022,8 @@ class StockAnalysisPipeline:
                     realtime_today['provider_timestamp'] = provider_timestamp
                 if fallback_from is not None:
                     realtime_today['fallback_from'] = fallback_from
+                if market_session is not None:
+                    realtime_today['market_session'] = market_session
                 realtime_owned_fields = {
                     'open', 'high', 'low', 'close',
                     'volume', 'amount', 'pct_chg', 'pctChg',
@@ -1002,6 +1033,7 @@ class StockAnalysisPipeline:
                     'isEstimated', 'estimated_fields', 'estimatedFields',
                     'fetched_at', 'fetchedAt', 'provider_timestamp',
                     'providerTimestamp', 'fallback_from', 'fallbackFrom',
+                    'market_session', 'marketSession',
                 }
                 for k, v in orig_today.items():
                     if k not in realtime_today and k not in realtime_owned_fields and v is not None:
@@ -1203,6 +1235,7 @@ class StockAnalysisPipeline:
         fundamental_context: Optional[Dict[str, Any]] = None,
         trend_result: Optional[TrendAnalysisResult] = None,
         *,
+        recent_intraday_price_action: Optional[Dict[str, Any]] = None,
         market_phase_context: Optional[Dict[str, Any]] = None,
         market_phase_summary: Optional[Dict[str, Any]] = None,
         daily_market_context: Optional[DailyMarketContext] = None,
@@ -1245,6 +1278,8 @@ class StockAnalysisPipeline:
             
             if realtime_quote:
                 initial_context["realtime_quote"] = self._safe_to_dict(realtime_quote)
+            if isinstance(recent_intraday_price_action, dict):
+                initial_context["recent_intraday_price_action"] = recent_intraday_price_action
             if chip_data:
                 initial_context["chip_distribution"] = self._safe_to_dict(chip_data)
             if trend_result:
@@ -2600,13 +2635,19 @@ class StockAnalysisPipeline:
                 "yesterday": {},
             }
 
+        agent_enhanced_context: Dict[str, Any] = {}
+        if isinstance(initial_context.get("recent_intraday_price_action"), dict):
+            agent_enhanced_context["recent_intraday_price_action"] = initial_context[
+                "recent_intraday_price_action"
+            ]
+
         return PipelineAnalysisArtifacts(
             code=code,
             stock_name=stock_name,
             market=market,
             phase=phase,
             base_context=daily_context,
-            enhanced_context={},
+            enhanced_context=agent_enhanced_context,
             realtime_quote=initial_context.get("realtime_quote"),
             trend_result=initial_context.get("trend_result"),
             chip_data=initial_context.get("chip_distribution"),

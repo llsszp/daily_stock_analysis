@@ -404,6 +404,52 @@ class AnalyzerNewsPromptTestCase(unittest.TestCase):
             self.assertNotIn("| 成交量 | 120.00 万股 |", prompt)
             self.assertNotIn("| 成交额 | 2.26 亿元 |", prompt)
 
+    def test_format_prompt_labels_overnight_realtime_price_not_close(self) -> None:
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        context = {
+            "code": "TSLA",
+            "stock_name": "特斯拉",
+            "date": "2026-07-09",
+            "today": {
+                "close": 395.77,
+                "open": 399.375,
+                "high": 395.91,
+                "low": 394.06,
+                "pct_chg": 0.43,
+                "volume": 33136,
+                "amount": 13087382.3,
+                "data_source": "realtime:longbridge",
+                "is_estimated": True,
+                "estimated_fields": ["close", "open", "high", "low"],
+                "market_session": "overnight",
+            },
+            "realtime": {
+                "price": 395.77,
+                "change_pct": 0.43,
+                "market_session": "overnight",
+            },
+            "market_phase_context": {
+                "market": "us",
+                "phase": "postmarket",
+                "is_partial_bar": False,
+                "warnings": [],
+            },
+        }
+
+        prompt = analyzer._format_prompt(context, "特斯拉", news_context=None)
+
+        self.assertIn("### 最新行情", prompt)
+        self.assertIn("| 夜盘实时价 | 395.77 元 |", prompt)
+        self.assertIn("不是完整交易日收盘价", prompt)
+        self.assertIn("| 行情时段 | overnight |", prompt)
+        self.assertNotIn("| 收盘价 | 395.77 元 |", prompt)
+        self.assertNotIn("### 今日行情", prompt)
+        self.assertNotIn("| 开盘价 |", prompt)
+        self.assertNotIn("| 最高价 |", prompt)
+        self.assertNotIn("| 最低价 |", prompt)
+
     def test_format_prompt_does_not_label_date_mismatch_as_previous_close(self) -> None:
         with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
             analyzer = GeminiAnalyzer()

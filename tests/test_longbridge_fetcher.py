@@ -18,6 +18,7 @@ import tempfile
 import time
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, PropertyMock
@@ -468,11 +469,28 @@ class TestLongbridgeFetcherMocked(unittest.TestCase):
             "low": "247.10",
             "volume": 49549600,
             "turnover": "12575000000",
+            "timestamp": None,
+            "pre_market_quote": None,
+            "post_market_quote": None,
+            "overnight_quote": None,
         }
         defaults.update(kwargs)
         for k, v in defaults.items():
             setattr(q, k, v)
         return q
+
+    def _make_mock_prepost_quote(self, **kwargs):
+        defaults = {
+            "last_done": "254.50",
+            "timestamp": datetime(2026, 7, 9, 1, 9, 15, tzinfo=timezone.utc),
+            "volume": 1000,
+            "turnover": "254500",
+            "high": "255.00",
+            "low": "253.80",
+            "prev_close": "253.79",
+        }
+        defaults.update(kwargs)
+        return SimpleNamespace(**defaults)
 
     def _make_mock_static(self, **kwargs):
         s = MagicMock()
@@ -517,6 +535,55 @@ class TestLongbridgeFetcherMocked(unittest.TestCase):
 
         # total_mv
         self.assertAlmostEqual(quote.total_mv, 253.79 * 16000000000, places=0)
+
+    def test_batch_prefetch_reuses_raw_quotes_and_static_info(self):
+        fetcher, ctx = self._make_fetcher_with_mock_ctx()
+        aapl_quote = self._make_mock_quote()
+        aapl_quote.symbol = "AAPL.US"
+        tsla_quote = self._make_mock_quote(last_done="396.20")
+        tsla_quote.symbol = "TSLA.US"
+        aapl_static = self._make_mock_static()
+        aapl_static.symbol = "AAPL.US"
+        tsla_static = self._make_mock_static(name_cn="特斯拉")
+        tsla_static.symbol = "TSLA.US"
+        ctx.quote.return_value = [aapl_quote, tsla_quote]
+        ctx.static_info.return_value = [aapl_static, tsla_static]
+        ctx.history_candlesticks_by_offset.return_value = []
+
+        count = fetcher.prefetch_realtime_quotes(["AAPL", "TSLA"])
+        aapl = fetcher.get_realtime_quote("AAPL")
+        tsla = fetcher.get_realtime_quote("TSLA")
+
+        self.assertEqual(count, 2)
+        self.assertIsNotNone(aapl)
+        self.assertIsNotNone(tsla)
+        ctx.quote.assert_called_once_with(["AAPL.US", "TSLA.US"])
+        ctx.static_info.assert_called_once_with(["AAPL.US", "TSLA.US"])
+
+    def test_us_quote_prefers_latest_extended_session_quote(self):
+        """US quote should use the freshest pre/post/overnight payload when present."""
+        fetcher, ctx = self._make_fetcher_with_mock_ctx()
+        ctx.quote.return_value = [self._make_mock_quote(
+            last_done="253.79",
+            prev_close="246.63",
+            timestamp=datetime(2026, 7, 9, 0, 0, 0, tzinfo=timezone.utc),
+            overnight_quote=self._make_mock_prepost_quote(
+                last_done="254.50",
+                timestamp=datetime(2026, 7, 9, 1, 9, 15, tzinfo=timezone.utc),
+                prev_close="253.79",
+            ),
+        )]
+        ctx.static_info.return_value = [self._make_mock_static()]
+        ctx.history_candlesticks_by_offset.return_value = []
+
+        quote = fetcher.get_realtime_quote("AAPL")
+
+        self.assertIsNotNone(quote)
+        self.assertAlmostEqual(quote.price, 254.50, places=2)
+        self.assertEqual(quote.market_session, "overnight")
+        self.assertEqual(quote.provider_timestamp, "2026-07-09T01:09:15+00:00")
+        self.assertAlmostEqual(quote.change_amount, 0.71, places=2)
+        self.assertAlmostEqual(quote.change_pct, 0.28, places=2)
 
     def test_turnover_falls_back_to_total_shares_when_circulating_zero(self):
         """US API often reports circulating_shares=0; use total_shares for turnover."""
@@ -570,6 +637,17 @@ class TestLongbridgeFetcherMocked(unittest.TestCase):
         expected_ratio = round(50000000 / avg_vol, 2)
         self.assertEqual(quote.volume_ratio, expected_ratio)
 
+    def test_realtime_quote_can_skip_volume_history_for_screening(self):
+        fetcher, ctx = self._make_fetcher_with_mock_ctx()
+        ctx.quote.return_value = [self._make_mock_quote(volume=50000000)]
+        ctx.static_info.return_value = [self._make_mock_static()]
+
+        quote = fetcher.get_realtime_quote("AAPL", include_volume_ratio=False)
+
+        self.assertIsNotNone(quote)
+        self.assertIsNone(quote.volume_ratio)
+        ctx.history_candlesticks_by_offset.assert_not_called()
+
     def test_quote_api_failure_returns_none(self):
         """If ctx.quote() raises, return None gracefully."""
         fetcher, ctx = self._make_fetcher_with_mock_ctx()
@@ -615,6 +693,63 @@ class TestLongbridgeFetcherMocked(unittest.TestCase):
         self.assertIsNotNone(quote)
         self.assertEqual(quote.code, "HK00700")
         ctx.quote.assert_called_with(["0700.HK"])
+
+    def test_recent_intraday_price_action_uses_extended_session_candlesticks(self):
+        """Recent 24h price action should use 5-minute K lines with all sessions."""
+        mock_lb_module = types.ModuleType("longbridge")
+        mock_lb_openapi = types.ModuleType("longbridge.openapi")
+        mock_lb_openapi.Period = SimpleNamespace(Min_5="Min_5")
+        mock_lb_openapi.AdjustType = SimpleNamespace(NoAdjust="NoAdjust")
+        mock_lb_openapi.TradeSessions = SimpleNamespace(All="All")
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        candles = []
+        for i in range(20):
+            ts = now - timedelta(minutes=5 * (19 - i))
+            candles.append(SimpleNamespace(
+                timestamp=ts,
+                open=str(390 + i * 0.1),
+                high=str(391 + i * 0.1),
+                low=str(389 + i * 0.1),
+                close=str(390.2 + i * 0.1),
+                volume=1000 + i,
+                turnover=str((390.2 + i * 0.1) * (1000 + i)),
+            ))
+        candles.insert(0, SimpleNamespace(
+            timestamp=now - timedelta(hours=30),
+            open="300",
+            high="301",
+            low="299",
+            close="300",
+            volume=1,
+            turnover="300",
+        ))
+
+        with patch.dict("sys.modules", {
+            "longbridge": mock_lb_module,
+            "longbridge.openapi": mock_lb_openapi,
+        }):
+            fetcher, ctx = self._make_fetcher_with_mock_ctx()
+            ctx.candlesticks.return_value = candles
+
+            payload = fetcher.get_recent_intraday_price_action("AAPL", hours=24)
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["symbol"], "AAPL.US")
+        self.assertEqual(payload["interval_minutes"], 5)
+        self.assertEqual(payload["trade_sessions"], "all")
+        self.assertEqual(payload["bar_count"], 20)
+        self.assertLessEqual(len(payload["sample_points"]), 18)
+        self.assertEqual(len(payload["recent_bars"]), 12)
+        self.assertIn("window_changes", payload["summary"])
+        self.assertGreater(payload["summary"]["change_pct"], 0)
+        ctx.candlesticks.assert_called_once_with(
+            "AAPL.US",
+            "Min_5",
+            300,
+            "NoAdjust",
+            "All",
+        )
 
 
 class TestSupplementFromLongbridge(unittest.TestCase):
@@ -686,6 +821,40 @@ class TestSupplementFromLongbridge(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.source, RealtimeSource.LONGBRIDGE)
         self.assertEqual(result.price, 253.79)
+
+    def test_screening_mode_can_skip_secondary_field_supplementation(self):
+        from data_provider.base import DataFetcherManager
+
+        lb_quote = UnifiedRealtimeQuote(
+            code="AAPL",
+            source=RealtimeSource.LONGBRIDGE,
+            price=253.79,
+            volume_ratio=None,
+            turnover_rate=None,
+        )
+        mock_lb_fetcher = MagicMock()
+        mock_lb_fetcher.name = "LongbridgeFetcher"
+        mock_lb_fetcher.get_realtime_quote.return_value = lb_quote
+        mock_lb_fetcher.is_available_for_request.return_value = True
+        manager = DataFetcherManager(fetchers=[mock_lb_fetcher])
+        config = SimpleNamespace(
+            enable_realtime_quote=True,
+            realtime_cache_ttl=600,
+        )
+
+        with patch("src.config.get_config", return_value=config), patch.object(
+            manager,
+            "_supplement_quote",
+            wraps=manager._supplement_quote,
+        ) as supplement_quote:
+            result = manager.get_realtime_quote("AAPL", supplement=False)
+
+        self.assertIsNotNone(result)
+        supplement_quote.assert_not_called()
+        mock_lb_fetcher.get_realtime_quote.assert_called_once_with(
+            "AAPL",
+            include_volume_ratio=False,
+        )
 
 
 if __name__ == "__main__":

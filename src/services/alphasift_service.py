@@ -17,16 +17,17 @@ import threading
 import time
 from contextvars import ContextVar
 from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
 from src.auth import COOKIE_NAME, is_auth_enabled, refresh_auth_state, verify_session
 from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, get_configured_llm_models
+from src.llm.local_cli_backend import redact_diagnostic_text
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ DSA_ALPHASIFT_CANDIDATE_CONTEXT_PROVIDERS = "news,fund_flow,announcement,quote"
 DSA_ALPHASIFT_DATA_DIR = Path("data") / "alphasift"
 DSA_ALPHASIFT_HOTSPOT_CACHE_PATH = DSA_ALPHASIFT_DATA_DIR / "hotspots.json"
 DSA_ALPHASIFT_HOTSPOT_HISTORY_PATH = DSA_ALPHASIFT_DATA_DIR / "hotspot.history.jsonl"
+DSA_US_SCREEN_HISTORY_PATH = DSA_ALPHASIFT_DATA_DIR / "us_screen.history.jsonl"
 DSA_ALPHASIFT_MIN_HOTSPOT_CACHE_COUNT = 3
 DSA_ALPHASIFT_HOTSPOT_DETAIL_CACHE_TTL_SECONDS = 30 * 60
 DSA_ALPHASIFT_HOTSPOT_EVENT_SUMMARY_MAX_CHARS = 90
@@ -71,6 +73,131 @@ DSA_ALPHASIFT_HOTSPOT_CONNECTIVITY_ERROR_MARKERS = (
 _DSA_FETCHER_MANAGER_LOCK = threading.RLock()
 _DSA_FETCHER_MANAGER: Any = None
 _FUNDAMENTAL_BLOCKS = ("valuation", "growth", "earnings", "institution", "capital_flow", "boards")
+DSA_US_DEFAULT_UNIVERSE = (
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+    "AMD",
+    "AVGO",
+    "NFLX",
+)
+DSA_US_LIQUID_ETF_UNIVERSE = (
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "SMH",
+    "XLK",
+    "XLF",
+    "XLE",
+    "TLT",
+    "GLD",
+)
+DSA_US_DEFAULT_NAMES = {
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "AMZN": "Amazon",
+    "GOOGL": "Alphabet",
+    "META": "Meta Platforms",
+    "TSLA": "Tesla",
+    "AMD": "AMD",
+    "AVGO": "Broadcom",
+    "NFLX": "Netflix",
+    "QQQ": "Invesco QQQ",
+    "SPY": "SPDR S&P 500 ETF",
+    "IWM": "iShares Russell 2000 ETF",
+    "DIA": "SPDR Dow Jones Industrial Average ETF",
+    "SMH": "VanEck Semiconductor ETF",
+    "XLK": "Technology Select Sector SPDR Fund",
+    "XLF": "Financial Select Sector SPDR Fund",
+    "XLE": "Energy Select Sector SPDR Fund",
+    "TLT": "iShares 20+ Year Treasury Bond ETF",
+    "GLD": "SPDR Gold Shares",
+}
+DSA_US_LIQUID_ETF_META = {
+    "SPY": {"industry": "标普500", "sector": "宽基ETF"},
+    "QQQ": {"industry": "纳斯达克100", "sector": "宽基ETF"},
+    "IWM": {"industry": "罗素2000小盘股", "sector": "宽基ETF"},
+    "DIA": {"industry": "道琼斯工业指数", "sector": "宽基ETF"},
+    "SMH": {"industry": "半导体", "sector": "行业ETF"},
+    "XLK": {"industry": "科技", "sector": "行业ETF"},
+    "XLF": {"industry": "金融", "sector": "行业ETF"},
+    "XLE": {"industry": "能源", "sector": "行业ETF"},
+    "TLT": {"industry": "美国长期国债", "sector": "债券ETF"},
+    "GLD": {"industry": "黄金", "sector": "商品ETF"},
+}
+DSA_US_STRATEGIES = (
+    {
+        "id": "dsa_us_realtime_momentum",
+        "name": "美股实时动量",
+        "title": "美股实时动量",
+        "description": "基于 DSA 实时行情筛选盘前、盘中、盘后和夜盘里短线强势的美股。",
+        "category": "美股",
+        "tag": "动量",
+        "tags": ["美股", "实时行情", "动量"],
+        "market_scope": ["us"],
+        "market": "us",
+    },
+    {
+        "id": "dsa_us_balanced_realtime",
+        "name": "美股实时均衡",
+        "title": "美股实时均衡",
+        "description": "结合实时涨跌、流动性和行情新鲜度，筛选更稳健的美股观察候选。",
+        "category": "美股",
+        "tag": "均衡",
+        "tags": ["美股", "实时行情", "均衡"],
+        "market_scope": ["us"],
+        "market": "us",
+    },
+    {
+        "id": "dsa_us_pullback_watchlist",
+        "name": "美股回踩观察",
+        "title": "美股回踩观察",
+        "description": "从默认美股池和自选美股中寻找轻度回调但流动性仍可观察的标的。",
+        "category": "美股",
+        "tag": "回踩",
+        "tags": ["美股", "实时行情", "回踩"],
+        "market_scope": ["us"],
+        "market": "us",
+    },
+    {
+        "id": "dsa_us_short_swing_recovery",
+        "name": "美股短线回踩修复",
+        "title": "美股短线回踩修复",
+        "description": "偏向高流动性、基本面相对稳健、近期可控回踩且扩展时段转强的短线候选。",
+        "category": "美股",
+        "tag": "短线",
+        "tags": ["美股", "短线", "回踩", "扩展时段"],
+        "market_scope": ["us"],
+        "market": "us",
+    },
+)
+DSA_US_STRATEGY_IDS = frozenset(item["id"] for item in DSA_US_STRATEGIES)
+DSA_US_DAILY_CALIBRATION_LOOKBACK_DAYS = 90
+DSA_US_DAILY_CALIBRATION_MIN_BARS = 20
+DSA_US_DAILY_CALIBRATION_CANDIDATE_MIN = 16
+DSA_US_DAILY_CALIBRATION_CANDIDATE_MAX = 24
+DSA_US_SHORT_SWING_DAILY_CALIBRATION_CANDIDATE_MAX = 32
+DSA_US_DAILY_HISTORY_CACHE_TTL_SECONDS = 15 * 60
+DSA_US_NASDAQ_UNIVERSE_CACHE_TTL_SECONDS = 6 * 60 * 60
+DSA_US_UNIVERSE_PREFILTER_LIMIT = 80
+DSA_US_SHORT_SWING_UNIVERSE_PREFILTER_LIMIT = 220
+DSA_US_REALTIME_PREFILTER_LIMIT = 32
+DSA_US_SHORT_SWING_REALTIME_PREFILTER_LIMIT = 40
+DSA_US_SHORT_SWING_INTRADAY_CANDIDATE_MAX = 10
+DSA_US_DYNAMIC_MIN_VOLUME = 200_000
+DSA_US_DYNAMIC_MIN_MARKET_CAP = 1_000_000_000
+DSA_US_DYNAMIC_MIN_PRICE = 5.0
+DSA_US_EXTENDED_SESSIONS = frozenset({"pre_market", "post_market", "overnight"})
+_DSA_US_DAILY_HISTORY_CACHE_LOCK = threading.RLock()
+_DSA_US_DAILY_HISTORY_CACHE: Dict[str, Tuple[float, Any, str]] = {}
+_DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK = threading.RLock()
+_DSA_US_NASDAQ_UNIVERSE_CACHE: Optional[Tuple[float, List[Dict[str, Any]]]] = None
 _ALPHASIFT_LITELLM_COMPLETION_ROUTES: ContextVar[Optional[Tuple[Dict[str, Any], ...]]] = ContextVar(
     "alphasift_litellm_completion_routes",
     default=None,
@@ -112,6 +239,12 @@ def _alphasift_hotspot_history_path() -> Path:
     if _env_text(os.getenv("ALPHASIFT_DATA_DIR")):
         return _resolve_alphasift_data_dir() / "hotspot.history.jsonl"
     return DSA_ALPHASIFT_HOTSPOT_HISTORY_PATH
+
+
+def _dsa_us_screen_history_path() -> Path:
+    if _env_text(os.getenv("ALPHASIFT_DATA_DIR")):
+        return _resolve_alphasift_data_dir() / "us_screen.history.jsonl"
+    return DSA_US_SCREEN_HISTORY_PATH
 
 
 def _alphasift_hotspot_detail_cache_dir() -> Path:
@@ -1090,6 +1223,8 @@ class AlphaSiftService:
     def screen(self, *, strategy: str, market: str, max_results: int) -> Dict[str, Any]:
         _ensure_alphasift_enabled(self.config)
         _ensure_alphasift_available_for_use()
+        if _is_dsa_us_screen_request(strategy=strategy, market=market):
+            return _screen_dsa_us(strategy=strategy, config=self.config, max_results=max_results)
         _ensure_supported_market(market)
         _ensure_supported_strategy(strategy)
 
@@ -1132,7 +1267,16 @@ class AlphaSiftService:
             "market": raw_data.get("market") or market,
             "snapshot_count": raw_data.get("snapshot_count"),
             "snapshot_source": raw_data.get("snapshot_source") or "",
+            "prefilter_count": raw_data.get("prefilter_count"),
+            "realtime_prefilter_count": raw_data.get("realtime_prefilter_count"),
+            "deep_score_limit": raw_data.get("deep_score_limit"),
+            "universe_source": raw_data.get("universe_source") or "",
+            "universe_eligible_count": raw_data.get("universe_eligible_count"),
+            "universe_limit": raw_data.get("universe_limit"),
+            "universe_basket_counts": raw_data.get("universe_basket_counts") or {},
             "after_filter_count": raw_data.get("after_filter_count"),
+            "ai_used": raw_data.get("ai_used"),
+            "ranking_method": raw_data.get("ranking_method") or "",
             "llm_ranked": raw_data.get("llm_ranked"),
             "llm_market_view": raw_data.get("llm_market_view") or "",
             "llm_selection_logic": raw_data.get("llm_selection_logic") or "",
@@ -1150,6 +1294,25 @@ class AlphaSiftService:
             "portfolio_diversity_enabled": raw_data.get("portfolio_diversity_enabled"),
             "portfolio_concentration_notes": raw_data.get("portfolio_concentration_notes") or [],
         }
+
+    def score_candidates_with_ai(
+        self,
+        *,
+        candidates: List[Dict[str, Any]],
+        strategy: str,
+        market: str,
+        run_id: str,
+        progress_callback: Optional[Callable[[Dict[str, Any], int, str], None]] = None,
+    ) -> Dict[str, Any]:
+        _ensure_alphasift_enabled(self.config)
+        return _score_dsa_screen_candidates_with_ai(
+            candidates=candidates,
+            strategy=strategy,
+            market=market,
+            run_id=run_id,
+            config=self.config,
+            progress_callback=progress_callback,
+        )
 
 
 def _normalize_alphasift_hotspot_detail(detail: Any, *, provider: str, requested_topic: str) -> Dict[str, Any]:
@@ -1705,8 +1868,10 @@ def _list_strategies() -> List[Dict[str, Any]]:
         strategy = _normalize_strategy(item)
         if not strategy.get("id"):
             continue
+        if not strategy.get("market_scope"):
+            strategy["market_scope"] = ["cn"]
         normalized.append(strategy)
-    return normalized
+    return _append_dsa_us_strategies(normalized)
 
 
 def _normalize_strategy(raw: Any) -> Dict[str, Any]:
@@ -1731,6 +1896,9 @@ def _normalize_strategy(raw: Any) -> Dict[str, Any]:
     )
     name = str(item.get("name") or item.get("title") or strategy_id)
     category = str(item.get("category") or item.get("tag") or "")
+    market = str(item.get("market") or item.get("market_id") or "")
+    if not market_scope and market:
+        market_scope = [market]
     return _strategy_model(
         id=strategy_id,
         name=name,
@@ -1740,7 +1908,7 @@ def _normalize_strategy(raw: Any) -> Dict[str, Any]:
         tag=str(item.get("tag") or category),
         tags=[str(tag) for tag in tags],
         market_scope=[str(market) for market in market_scope],
-        market=str(item.get("market") or item.get("market_id") or ""),
+        market=market,
     )
 
 
@@ -1750,6 +1918,2063 @@ def _strategy_model(**kwargs: Any) -> Dict[str, Any]:
         return normalized.model_dump()
     except AttributeError:
         return normalized.dict()
+
+
+def _append_dsa_us_strategies(strategies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    existing_ids = {str(item.get("id") or "") for item in strategies}
+    result = list(strategies)
+    for item in DSA_US_STRATEGIES:
+        if item["id"] in existing_ids:
+            continue
+        result.append(_strategy_model(**item))
+    return result
+
+
+def _is_dsa_us_screen_request(*, strategy: str, market: str) -> bool:
+    return _env_text(market).lower() == "us" and _env_text(strategy) in DSA_US_STRATEGY_IDS
+
+
+def _screen_dsa_us(*, strategy: str, config: Config, max_results: int) -> Dict[str, Any]:
+    limit = max(1, min(int(max_results or 20), 100))
+    universe_result = _build_dsa_us_universe(config, strategy=strategy)
+    if isinstance(universe_result, tuple):
+        universe, universe_meta = universe_result
+    else:
+        universe, universe_meta = universe_result, {}
+    candidates, source_errors = _build_dsa_us_candidates(
+        strategy=strategy,
+        universe=universe,
+        max_results=limit,
+        symbol_meta=universe_meta.get("symbol_meta") or {},
+    )
+    selected, concentration_notes = _select_dsa_us_diversified_candidates(candidates, limit=limit)
+    selected, dsa_enrichment = _enrich_candidates_with_dsa(selected)
+    warnings: List[str] = list(universe_meta.get("warnings") or [])
+    source_errors = [*(universe_meta.get("source_errors") or []), *source_errors]
+    snapshot_count = int(_safe_float(universe_meta.get("snapshot_count")) or len(universe))
+    prefilter_count = int(_safe_float(universe_meta.get("prefilter_count")) or len(universe))
+    if not candidates:
+        warnings.append("DSA US realtime screen returned no candidates with usable prices.")
+    if len(universe) > len(candidates):
+        warnings.append(
+            f"DSA US screen fully scored {len(candidates)} of {len(universe)} prefiltered symbols after realtime pre-rank."
+        )
+    payload = {
+        "enabled": True,
+        "candidates": selected,
+        "candidate_count": len(selected),
+        "run_id": f"dsa-us-{int(time.time())}",
+        "strategy": strategy,
+        "market": "us",
+        "snapshot_count": snapshot_count,
+        "snapshot_source": universe_meta.get("snapshot_source") or "dsa_us_universe",
+        "prefilter_count": prefilter_count,
+        "universe_source": universe_meta.get("universe_source") or "configured_and_default",
+        "universe_eligible_count": universe_meta.get("eligible_count"),
+        "universe_limit": universe_meta.get("limit"),
+        "universe_basket_counts": universe_meta.get("basket_counts") or {},
+        "realtime_prefilter_count": min(len(universe), _dsa_us_realtime_prefilter_limit(strategy)),
+        "deep_score_limit": min(
+            min(len(universe), _dsa_us_realtime_prefilter_limit(strategy)),
+            _dsa_us_daily_calibration_candidate_max(strategy),
+        ),
+        "after_filter_count": len(candidates),
+        "ai_used": False,
+        "ranking_method": "quantitative_rules",
+        "llm_ranked": False,
+        "llm_market_view": "",
+        "llm_selection_logic": "Quantitative ranking using realtime quotes, recent daily trend, and recent 24-hour intraday factors; AI is not used for ranking.",
+        "llm_portfolio_risk": "",
+        "llm_coverage": 0,
+        "llm_parse_errors": [],
+        "warnings": warnings,
+        "source_errors": _dedupe_strings(source_errors),
+        "dsa_enrichment": dsa_enrichment,
+        "deep_analysis_requested": False,
+        "post_analyzers": ["dsa_us_realtime_quote", f"dsa_us_universe:{universe_meta.get('universe_source') or 'local'}"],
+        "daily_enriched": False,
+        "daily_enrich_count": None,
+        "risk_enabled": True,
+        "portfolio_diversity_enabled": True,
+        "portfolio_concentration_notes": concentration_notes,
+    }
+    _append_dsa_us_screen_history(
+        payload,
+        ranked_candidates=candidates,
+        prefiltered_symbols=universe,
+    )
+    return payload
+
+
+def _score_dsa_screen_candidates_with_ai(
+    *,
+    candidates: List[Dict[str, Any]],
+    strategy: str,
+    market: str,
+    run_id: str,
+    config: Config,
+    progress_callback: Optional[Callable[[Dict[str, Any], int, str], None]] = None,
+) -> Dict[str, Any]:
+    normalized_candidates = [
+        _normalize_candidate(candidate, index + 1)
+        for index, candidate in enumerate(candidates)
+        if isinstance(candidate, dict) and _env_text(candidate.get("code"))
+    ]
+    items: List[Dict[str, Any]] = [
+        {
+            "rank": candidate.get("rank") or index + 1,
+            "code": _env_text(candidate.get("code")),
+            "name": _env_text(candidate.get("name")),
+            "status": "pending",
+        }
+        for index, candidate in enumerate(normalized_candidates)
+    ]
+    total_count = len(items)
+    processed_count = 0
+    completed_count = 0
+    failed_count = 0
+
+    def snapshot(*, current_code: str = "", status: str = "processing") -> Dict[str, Any]:
+        return _remove_non_finite_json_values({
+            "run_id": run_id,
+            "strategy": strategy,
+            "market": market,
+            "status": status,
+            "current_code": current_code,
+            "total_count": total_count,
+            "processed_count": processed_count,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "items": items,
+        })
+
+    def publish(payload: Dict[str, Any], progress: int, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(payload, progress, message)
+
+    if not items:
+        return snapshot(status="completed")
+
+    try:
+        from src.analyzer import GeminiAnalyzer
+
+        scoring_config = _dsa_ai_scoring_config(config)
+        analyzer = GeminiAnalyzer(config=scoring_config)
+    except Exception as exc:
+        error = redact_diagnostic_text(str(exc), limit=160) or "AI评分器初始化失败"
+        for item in items:
+            item.update({"status": "failed", "error": error})
+        failed_count = total_count
+        processed_count = total_count
+        payload = snapshot(status="completed")
+        publish(payload, 95, f"AI评分不可用，{total_count} 只候选均未完成")
+        return payload
+
+    for index, candidate in enumerate(normalized_candidates):
+        code = _env_text(candidate.get("code"))
+        items[index]["status"] = "running"
+        running_payload = snapshot(current_code=code)
+        progress_before = 10 + int((processed_count / max(total_count, 1)) * 80)
+        publish(running_payload, progress_before, f"正在为 {code} 进行 AI 评分（{index + 1}/{total_count}）")
+
+        try:
+            scored = _score_dsa_candidate_with_ai(
+                analyzer=analyzer,
+                candidate=candidate,
+                strategy=strategy,
+                market=market,
+                config=scoring_config,
+            )
+            items[index].update({"status": "completed", **scored})
+            completed_count += 1
+        except Exception as exc:
+            safe_error = redact_diagnostic_text(str(exc), limit=160) or "AI评分失败"
+            logger.warning("DSA screen AI score failed for %s: %s", code, safe_error)
+            items[index].update({"status": "failed", "error": safe_error})
+            failed_count += 1
+
+        processed_count += 1
+        status = "completed" if processed_count >= total_count else "processing"
+        current_code = "" if status == "completed" else _env_text(normalized_candidates[index + 1].get("code"))
+        payload = snapshot(current_code=current_code, status=status)
+        progress_after = min(95, 10 + int((processed_count / max(total_count, 1)) * 85))
+        publish(payload, progress_after, f"AI评分进度 {processed_count}/{total_count}")
+
+    return snapshot(status="completed")
+
+
+def _score_dsa_candidate_with_ai(
+    *,
+    analyzer: Any,
+    candidate: Dict[str, Any],
+    strategy: str,
+    market: str,
+    config: Config,
+) -> Dict[str, Any]:
+    context = _build_dsa_candidate_ai_score_context(candidate, strategy=strategy, market=market)
+    prompt = (
+        "你是美股短线候选复核员。请基于给定数据独立评估这只候选股票，"
+        "量化分只是输入之一，不要机械照抄。重点检查流动性、近期回踩位置、日线趋势、"
+        "最近24小时走势、追高风险、数据缺口，以及它是否适合短线交易。ETF 不应因没有公司市盈率被扣分。"
+        "不得编造输入中不存在的价格、财报或新闻。\n\n"
+        "只输出一个 JSON 对象，不要输出 Markdown 或解释文字，格式如下：\n"
+        "{\"score\":0到100,\"confidence\":0到1,\"thesis\":\"80字以内判断\","
+        "\"risks\":[\"最多3项\"],\"watch_items\":[\"最多3项\"],"
+        "\"catalysts\":[\"最多3项\"],\"style_fit\":\"适合/谨慎/不适合\","
+        "\"theme\":\"可为空\",\"tags\":[\"最多3项\"]}\n\n"
+        f"候选数据：{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+    )
+    response_text = analyzer.generate_text(prompt, max_tokens=2400, temperature=0.2)
+    if not _env_text(response_text):
+        raise RuntimeError("LLM returned empty response")
+    parsed = _parse_dsa_candidate_ai_score_response(_env_text(response_text))
+    score = _safe_float(parsed.get("score"))
+    if score is None:
+        raise ValueError("AI评分响应缺少 score")
+    confidence = _safe_float(parsed.get("confidence"))
+    if confidence is None:
+        confidence = 0.5
+    if confidence > 1.0:
+        confidence /= 100.0
+
+    return {
+        "llm_score": round(_clamp_float(score, 0.0, 100.0), 1),
+        "llm_confidence": round(_clamp_float(confidence, 0.0, 1.0), 3),
+        "llm_thesis": _truncate_text(_env_text(parsed.get("thesis")), 160),
+        "llm_risks": _dsa_ai_text_list(parsed.get("risks"), limit=3),
+        "llm_watch_items": _dsa_ai_text_list(parsed.get("watch_items"), limit=3),
+        "llm_catalysts": _dsa_ai_text_list(parsed.get("catalysts"), limit=3),
+        "llm_style_fit": _truncate_text(_env_text(parsed.get("style_fit")), 24),
+        "llm_theme": _truncate_text(_env_text(parsed.get("theme")), 40),
+        "llm_tags": _dsa_ai_text_list(parsed.get("tags"), limit=3),
+        "llm_sector": _env_text(candidate.get("sector")),
+        "model": _env_text(config.litellm_model),
+        "scored_at": _utc_now_iso(),
+    }
+
+
+def _build_dsa_candidate_ai_score_context(
+    candidate: Dict[str, Any],
+    *,
+    strategy: str,
+    market: str,
+) -> Dict[str, Any]:
+    dsa_context = candidate.get("dsa_context") if isinstance(candidate.get("dsa_context"), dict) else {}
+    quote = dsa_context.get("quote") if isinstance(dsa_context.get("quote"), dict) else {}
+    daily = dsa_context.get("daily_calibration") if isinstance(dsa_context.get("daily_calibration"), dict) else {}
+    intraday = dsa_context.get("recent_intraday") if isinstance(dsa_context.get("recent_intraday"), dict) else {}
+    intraday_summary = intraday.get("summary") if isinstance(intraday.get("summary"), dict) else {}
+    news_items = candidate.get("dsa_news") if isinstance(candidate.get("dsa_news"), list) else []
+    compact_news = [
+        {
+            "title": _truncate_text(_env_text(item.get("title")), 140),
+            "snippet": _truncate_text(_env_text(item.get("snippet")), 240),
+            "published_date": item.get("published_date"),
+        }
+        for item in news_items[:3]
+        if isinstance(item, dict)
+    ]
+    factor_scores = candidate.get("factor_scores") if isinstance(candidate.get("factor_scores"), dict) else {}
+    return _remove_non_finite_json_values({
+        "strategy": strategy,
+        "market": market,
+        "rank": candidate.get("rank"),
+        "code": candidate.get("code"),
+        "name": candidate.get("name"),
+        "asset_type": candidate.get("asset_type"),
+        "industry": candidate.get("industry"),
+        "sector": candidate.get("sector"),
+        "quant_score": candidate.get("score"),
+        "quant_reason": _truncate_text(_env_text(candidate.get("reason")), 800),
+        "risk_level": candidate.get("risk_level"),
+        "risk_flags": candidate.get("risk_flags") or [],
+        "data_confidence": candidate.get("data_confidence"),
+        "data_warnings": candidate.get("data_warnings") or [],
+        "price": candidate.get("price"),
+        "change_pct": candidate.get("change_pct"),
+        "amount": candidate.get("amount"),
+        "quote": {
+            "market_session": quote.get("market_session"),
+            "provider_timestamp": quote.get("provider_timestamp"),
+            "pre_close": quote.get("pre_close") or quote.get("prev_close"),
+            "volume_ratio": quote.get("volume_ratio"),
+            "pe_ratio": quote.get("pe_ratio"),
+        },
+        "factor_scores": factor_scores,
+        "daily_calibration": daily,
+        "recent_24h": intraday_summary,
+        "news": compact_news,
+    })
+
+
+def _dsa_ai_scoring_config(config: Config) -> Config:
+    configured_models = get_configured_llm_models(config.llm_model_list or [])
+    preferred_model = next(
+        (
+            model
+            for model in configured_models
+            if "flash" in model.lower() or "mini" in model.lower()
+        ),
+        _env_text(config.litellm_model),
+    )
+    if not preferred_model or preferred_model == _env_text(config.litellm_model):
+        return config
+    fallbacks = _dedupe_strings([
+        _env_text(config.litellm_model),
+        *(config.litellm_fallback_models or []),
+    ])
+    return replace(
+        config,
+        litellm_model=preferred_model,
+        litellm_fallback_models=[model for model in fallbacks if model and model != preferred_model],
+    )
+
+
+def _parse_dsa_candidate_ai_score_response(text: str) -> Dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("AI评分响应不是有效 JSON")
+
+
+def _dsa_ai_text_list(value: Any, *, limit: int) -> List[str]:
+    if isinstance(value, str):
+        values = re.split(r"[，,；;\n]", value)
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = []
+    result: List[str] = []
+    for item in values:
+        text = _truncate_text(_env_text(item), 100)
+        if text and text not in result:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _build_dsa_us_universe(config: Config, *, strategy: str = "") -> Tuple[List[str], Dict[str, Any]]:
+    dynamic_symbols, dynamic_meta = _build_dsa_us_dynamic_universe(strategy=strategy)
+    candidates = _interleave_dsa_us_liquid_etfs(dynamic_symbols)
+    configured = getattr(config, "stock_list", None) or []
+    for raw_code in configured:
+        normalized = _normalize_us_screen_symbol(raw_code)
+        if normalized:
+            candidates.append(normalized)
+    candidates.extend(DSA_US_DEFAULT_UNIVERSE)
+    universe = _dedupe_strings(candidates)
+    symbol_meta = dict(dynamic_meta.get("symbol_meta") or {})
+    for code in DSA_US_LIQUID_ETF_UNIVERSE:
+        etf_meta = DSA_US_LIQUID_ETF_META.get(code) or {}
+        symbol_meta[code] = {
+            "name": DSA_US_DEFAULT_NAMES.get(code, code),
+            "sector": etf_meta.get("sector") or "ETF",
+            "industry": etf_meta.get("industry") or "ETF",
+            "country": "United States",
+            "asset_type": "etf",
+        }
+    for code in universe:
+        symbol_meta.setdefault(code, {"name": DSA_US_DEFAULT_NAMES.get(code, code)})
+    basket_counts = dict(dynamic_meta.get("basket_counts") or {})
+    basket_counts["liquid_etf"] = len(DSA_US_LIQUID_ETF_UNIVERSE)
+    meta = {
+        **dynamic_meta,
+        "prefilter_count": len(universe),
+        "configured_count": len([code for code in configured if _normalize_us_screen_symbol(code)]),
+        "default_count": len(DSA_US_DEFAULT_UNIVERSE),
+        "etf_count": len(DSA_US_LIQUID_ETF_UNIVERSE),
+        "eligible_count": int(_safe_float(dynamic_meta.get("eligible_count")) or 0)
+        + len(DSA_US_LIQUID_ETF_UNIVERSE),
+        "limit": int(_safe_float(dynamic_meta.get("limit")) or len(dynamic_symbols))
+        + len(DSA_US_LIQUID_ETF_UNIVERSE),
+        "basket_counts": basket_counts,
+        "universe_source": "nasdaq_screener_plus_liquid_etfs" if dynamic_symbols else "configured_default_and_liquid_etfs",
+        "symbol_meta": symbol_meta,
+    }
+    if not dynamic_meta.get("snapshot_count"):
+        meta["snapshot_count"] = len(universe)
+    return universe, meta
+
+
+def _interleave_dsa_us_liquid_etfs(dynamic_symbols: List[str], *, interval: int = 6) -> List[str]:
+    if not dynamic_symbols:
+        return list(DSA_US_LIQUID_ETF_UNIVERSE)
+    result: List[str] = []
+    etf_index = 0
+    interval = max(1, int(interval or 6))
+    for index, symbol in enumerate(dynamic_symbols, 1):
+        result.append(symbol)
+        if index % interval == 0 and etf_index < len(DSA_US_LIQUID_ETF_UNIVERSE):
+            result.append(DSA_US_LIQUID_ETF_UNIVERSE[etf_index])
+            etf_index += 1
+    result.extend(DSA_US_LIQUID_ETF_UNIVERSE[etf_index:])
+    return _dedupe_strings(result)
+
+
+def _normalize_us_screen_symbol(value: Any) -> str:
+    text = _env_text(value).upper()
+    if not text:
+        return ""
+    text = text.replace("/", ".")
+    if text.endswith(".US"):
+        text = text[:-3]
+    text = text.replace("-", ".")
+    if not re.fullmatch(r"[A-Z][A-Z0-9]{0,4}(?:\.[A-Z])?", text):
+        return ""
+    if text.startswith("HK") or text.endswith((".HK", ".T", ".KS", ".TW", ".SS", ".SZ", ".SH")):
+        return ""
+    return text
+
+
+def _build_dsa_us_dynamic_universe(*, strategy: str = "") -> Tuple[List[str], Dict[str, Any]]:
+    try:
+        rows = _fetch_dsa_us_nasdaq_screener_rows()
+    except Exception as exc:  # noqa: BLE001 - dynamic universe should degrade to local defaults.
+        return [], {
+            "snapshot_source": "dsa_us_universe",
+            "universe_source": "configured_and_default",
+            "source_errors": [f"nasdaq_screener_universe_failed: {exc}"],
+            "warnings": ["Nasdaq screener universe unavailable; using configured/default US symbols only."],
+        }
+
+    raw_count = len(rows)
+    eligible_rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = _normalize_us_screen_symbol(row.get("symbol"))
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        if not _is_dsa_us_dynamic_universe_row(row):
+            continue
+        metrics = _dsa_us_dynamic_universe_row_metrics(row)
+        eligible_rows.append(
+            {
+                **metrics,
+                "symbol": symbol,
+                "name": _env_text(row.get("name")),
+                "sector": _env_text(row.get("sector")),
+                "industry": _env_text(row.get("industry")),
+                "country": _env_text(row.get("country")),
+                "score": _score_dsa_us_dynamic_universe_row(row),
+            }
+        )
+
+    limit = _dsa_us_dynamic_universe_limit(strategy)
+    symbols, basket_counts = _select_dsa_us_dynamic_universe_symbols(
+        eligible_rows,
+        limit=limit,
+        strategy=strategy,
+    )
+    selected_set = set(symbols)
+    symbol_meta = {
+        _env_text(row.get("symbol")): {
+            "name": _env_text(row.get("name")),
+            "sector": _env_text(row.get("sector")),
+            "industry": _env_text(row.get("industry")),
+            "country": _env_text(row.get("country")),
+            "snapshot_price": _safe_float(row.get("price")),
+            "snapshot_volume": _safe_float(row.get("volume")),
+            "snapshot_market_cap": _safe_float(row.get("market_cap")),
+            "snapshot_change_pct": _safe_float(row.get("pct_change")),
+        }
+        for row in eligible_rows
+        if _env_text(row.get("symbol")) in selected_set
+    }
+    return symbols, {
+        "snapshot_count": raw_count,
+        "snapshot_source": "nasdaq_screener",
+        "universe_source": "nasdaq_screener",
+        "eligible_count": len(eligible_rows),
+        "limit": limit,
+        "basket_counts": basket_counts,
+        "symbol_meta": symbol_meta,
+        "source_errors": [],
+        "warnings": [],
+    }
+
+
+def _dsa_us_dynamic_universe_limit(strategy: str) -> int:
+    env_value = _safe_float(os.getenv("DSA_US_UNIVERSE_PREFILTER_LIMIT"))
+    if env_value is not None and env_value > 0:
+        return max(10, min(500, int(env_value)))
+    if strategy == "dsa_us_short_swing_recovery":
+        return DSA_US_SHORT_SWING_UNIVERSE_PREFILTER_LIMIT
+    return DSA_US_UNIVERSE_PREFILTER_LIMIT
+
+
+def _select_dsa_us_dynamic_universe_symbols(
+    rows: List[Dict[str, Any]],
+    *,
+    limit: int,
+    strategy: str = "",
+) -> Tuple[List[str], Dict[str, int]]:
+    if limit <= 0 or not rows:
+        return [], {}
+
+    if strategy != "dsa_us_short_swing_recovery":
+        ranked = sorted(rows, key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        symbols = [_env_text(item.get("symbol")) for item in ranked[:limit]]
+        return [symbol for symbol in symbols if symbol], {"composite": len(symbols)}
+
+    basket_defs: List[Tuple[str, List[Dict[str, Any]], int]] = [
+        (
+            "liquidity",
+            sorted(
+                rows,
+                key=lambda item: (float(item.get("score") or 0.0), float(item.get("volume") or 0.0)),
+                reverse=True,
+            ),
+            max(24, int(limit * 0.34)),
+        ),
+        (
+            "controlled_pullback",
+            sorted(
+                rows,
+                key=lambda item: (
+                    _score_dsa_us_snapshot_pullback_item(item),
+                    float(item.get("score") or 0.0),
+                ),
+                reverse=True,
+            ),
+            max(36, int(limit * 0.30)),
+        ),
+        (
+            "extended_strength_proxy",
+            sorted(
+                rows,
+                key=lambda item: (
+                    _score_dsa_us_snapshot_momentum_item(item),
+                    float(item.get("score") or 0.0),
+                ),
+                reverse=True,
+            ),
+            max(24, int(limit * 0.22)),
+        ),
+        (
+            "large_quality",
+            sorted(
+                rows,
+                key=lambda item: (
+                    math.log10(float(item.get("market_cap") or 0.0) + 1.0),
+                    math.log10(float(item.get("volume") or 0.0) + 1.0),
+                ),
+                reverse=True,
+            ),
+            max(18, int(limit * 0.18)),
+        ),
+    ]
+
+    selected: List[str] = []
+    selected_set: set[str] = set()
+    basket_counts: Dict[str, int] = {name: 0 for name, _ranked, _target in basket_defs}
+    positions: Dict[str, int] = {name: 0 for name, _ranked, _target in basket_defs}
+
+    made_progress = True
+    while len(selected) < limit and made_progress:
+        made_progress = False
+        for name, ranked, target in basket_defs:
+            if basket_counts[name] >= target:
+                continue
+            index = positions[name]
+            while index < len(ranked):
+                symbol = _env_text(ranked[index].get("symbol"))
+                index += 1
+                if not symbol or symbol in selected_set:
+                    continue
+                selected.append(symbol)
+                selected_set.add(symbol)
+                basket_counts[name] += 1
+                positions[name] = index
+                made_progress = True
+                break
+            positions[name] = index
+            if len(selected) >= limit:
+                break
+
+    fill_ranked = sorted(rows, key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    fill_count = 0
+    for item in fill_ranked:
+        if len(selected) >= limit:
+            break
+        symbol = _env_text(item.get("symbol"))
+        if not symbol or symbol in selected_set:
+            continue
+        selected.append(symbol)
+        selected_set.add(symbol)
+        fill_count += 1
+    if fill_count:
+        basket_counts["composite_fill"] = fill_count
+    return selected, {name: count for name, count in basket_counts.items() if count > 0}
+
+
+def _fetch_dsa_us_nasdaq_screener_rows() -> List[Dict[str, Any]]:
+    now = time.time()
+    global _DSA_US_NASDAQ_UNIVERSE_CACHE
+    with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
+        if (
+            _DSA_US_NASDAQ_UNIVERSE_CACHE is not None
+            and now - _DSA_US_NASDAQ_UNIVERSE_CACHE[0] <= DSA_US_NASDAQ_UNIVERSE_CACHE_TTL_SECONDS
+        ):
+            return [dict(row) for row in _DSA_US_NASDAQ_UNIVERSE_CACHE[1]]
+
+    cached_rows = _read_dsa_us_nasdaq_universe_cache(allow_stale=False)
+    if cached_rows:
+        with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
+            _DSA_US_NASDAQ_UNIVERSE_CACHE = (now, cached_rows)
+        return [dict(row) for row in cached_rows]
+
+    import requests
+
+    response = requests.get(
+        "https://api.nasdaq.com/api/screener/stocks",
+        params={"tableonly": "true", "limit": "25", "offset": "0", "download": "true"},
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": "https://www.nasdaq.com/market-activity/stocks/screener",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = ((payload.get("data") or {}).get("rows") or []) if isinstance(payload, dict) else []
+    normalized_rows = [dict(row) for row in rows if isinstance(row, dict)]
+    if not normalized_rows:
+        stale_rows = _read_dsa_us_nasdaq_universe_cache(allow_stale=True)
+        if stale_rows:
+            return [dict(row) for row in stale_rows]
+        return []
+    _write_dsa_us_nasdaq_universe_cache(normalized_rows)
+    with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
+        _DSA_US_NASDAQ_UNIVERSE_CACHE = (now, normalized_rows)
+    return [dict(row) for row in normalized_rows]
+
+
+def _dsa_us_nasdaq_universe_cache_path() -> Path:
+    return _resolve_alphasift_data_dir() / "us_universe_nasdaq.json"
+
+
+def _read_dsa_us_nasdaq_universe_cache(*, allow_stale: bool) -> List[Dict[str, Any]]:
+    cache_path = _dsa_us_nasdaq_universe_cache_path()
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        logger.warning("Failed to read DSA US universe cache from %s: %s", cache_path, exc)
+        return []
+    cached_at = _parse_cache_datetime(raw.get("cached_at") if isinstance(raw, dict) else None)
+    rows = raw.get("rows") if isinstance(raw, dict) else None
+    if cached_at is None or not isinstance(rows, list):
+        return []
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - cached_at).total_seconds())
+    if age_seconds > DSA_US_NASDAQ_UNIVERSE_CACHE_TTL_SECONDS and not allow_stale:
+        return []
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _write_dsa_us_nasdaq_universe_cache(rows: List[Dict[str, Any]]) -> None:
+    cache_path = _dsa_us_nasdaq_universe_cache_path()
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"cached_at": _utc_now_iso(), "rows": rows}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("Failed to write DSA US universe cache to %s: %s", cache_path, exc)
+
+
+def _is_dsa_us_dynamic_universe_row(row: Dict[str, Any]) -> bool:
+    name = _env_text(row.get("name"))
+    if re.search(
+        r"\b(warrants?|rights?|units?|preferred|preference|notes?|debentures?|etf|etn|fund|closed end|acquisition corp)\b",
+        name,
+        re.I,
+    ):
+        return False
+    metrics = _dsa_us_dynamic_universe_row_metrics(row)
+    price = _safe_float(metrics.get("price"))
+    volume = _safe_float(metrics.get("volume"))
+    market_cap = _safe_float(metrics.get("market_cap"))
+    if price is not None and price < DSA_US_DYNAMIC_MIN_PRICE:
+        return False
+    if volume is not None and volume < DSA_US_DYNAMIC_MIN_VOLUME:
+        return False
+    if market_cap is not None and market_cap < DSA_US_DYNAMIC_MIN_MARKET_CAP:
+        return False
+    return True
+
+
+def _dsa_us_dynamic_universe_row_metrics(row: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "price": _parse_dsa_us_nasdaq_number(row.get("lastsale")),
+        "volume": _parse_dsa_us_nasdaq_number(row.get("volume")),
+        "market_cap": _parse_dsa_us_nasdaq_number(row.get("marketCap")),
+        "pct_change": _parse_dsa_us_nasdaq_number(row.get("pctchange")),
+    }
+
+
+def _parse_dsa_us_nasdaq_number(value: Any) -> float:
+    text = str(value or "").replace("$", "").replace("%", "").replace(",", "").strip()
+    return _safe_float(text) or 0.0
+
+
+def _score_dsa_us_dynamic_universe_row(row: Dict[str, Any]) -> float:
+    metrics = _dsa_us_dynamic_universe_row_metrics(row)
+    volume = max(metrics.get("volume") or 0.0, 0.0)
+    market_cap = max(metrics.get("market_cap") or 0.0, 0.0)
+    pct_change = metrics.get("pct_change") or 0.0
+    volume_score = math.log10(volume + 1.0) * 12.0
+    cap_score = math.log10(market_cap + 1.0) * 4.0
+    change_score = _clamp_float(pct_change, -6.0, 8.0) * 1.2
+    return volume_score + cap_score + change_score
+
+
+def _score_dsa_us_snapshot_pullback_item(item: Dict[str, Any]) -> float:
+    pct_change = float(item.get("pct_change") or 0.0)
+    volume = max(float(item.get("volume") or 0.0), 0.0)
+    market_cap = max(float(item.get("market_cap") or 0.0), 0.0)
+    pullback_fit = max(0.0, 8.0 - abs(pct_change + 1.8) * 2.0)
+    if pct_change > 4.0:
+        pullback_fit -= min(6.0, (pct_change - 4.0) * 1.5)
+    if pct_change < -9.0:
+        pullback_fit -= min(8.0, abs(pct_change + 9.0) * 1.2)
+    liquidity = math.log10(volume + 1.0) * 5.0 + math.log10(market_cap + 1.0) * 1.6
+    return pullback_fit * 7.0 + liquidity
+
+
+def _score_dsa_us_snapshot_momentum_item(item: Dict[str, Any]) -> float:
+    pct_change = float(item.get("pct_change") or 0.0)
+    volume = max(float(item.get("volume") or 0.0), 0.0)
+    market_cap = max(float(item.get("market_cap") or 0.0), 0.0)
+    momentum = _clamp_float(pct_change, -3.0, 10.0) * 7.0
+    liquidity = math.log10(volume + 1.0) * 5.0 + math.log10(market_cap + 1.0)
+    return momentum + liquidity
+
+
+def _dsa_us_scoring_liquidity_amount(
+    *,
+    quote: Dict[str, Any],
+    symbol_info: Dict[str, Any],
+) -> float:
+    session_amount = _safe_float(quote.get("amount"))
+    if session_amount is None:
+        volume = _safe_float(quote.get("volume"))
+        price = _safe_float(quote.get("price"))
+        if volume is not None and price is not None:
+            session_amount = volume * price
+    snapshot_volume = _safe_float(symbol_info.get("snapshot_volume"))
+    snapshot_price = _safe_float(symbol_info.get("snapshot_price"))
+    snapshot_amount = (
+        snapshot_volume * snapshot_price
+        if snapshot_volume is not None and snapshot_price is not None
+        else None
+    )
+    return max(float(session_amount or 0.0), float(snapshot_amount or 0.0))
+
+
+def _merge_dsa_us_quote_with_intraday(
+    quote: Dict[str, Any],
+    intraday: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged = dict(quote)
+    summary = intraday.get("summary") if isinstance(intraday, dict) else None
+    if not isinstance(summary, dict):
+        return merged
+    end_time = _parse_cache_datetime(summary.get("end_time") or intraday.get("end_time"))
+    last_price = _safe_float(summary.get("last_price"))
+    if end_time is None or last_price is None or last_price <= 0:
+        return merged
+    stale_seconds = max(0, int((datetime.now(timezone.utc) - end_time).total_seconds()))
+    if stale_seconds > 20 * 60:
+        return merged
+    quote_time = _parse_cache_datetime(quote.get("provider_timestamp"))
+    if quote_time is not None and quote_time >= end_time:
+        return merged
+
+    original_timestamp = quote.get("provider_timestamp")
+    merged["price"] = last_price
+    merged["provider_timestamp"] = end_time.isoformat()
+    merged["stale_seconds"] = stale_seconds
+    merged["is_stale"] = False
+    merged["price_context"] = "recent_intraday_5m"
+    merged["original_provider_timestamp"] = original_timestamp
+    previous_close = _safe_float(quote.get("pre_close") or quote.get("prev_close"))
+    if previous_close is not None and previous_close > 0:
+        merged["change_amount"] = round(last_price - previous_close, 4)
+        merged["change_pct"] = round((last_price - previous_close) / previous_close * 100.0, 2)
+    return merged
+
+
+def _build_dsa_us_candidates(
+    *,
+    strategy: str,
+    universe: List[str],
+    max_results: int = 20,
+    symbol_meta: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    source_errors: List[str] = []
+    symbol_meta = symbol_meta or {}
+    realtime_universe = universe[:_dsa_us_realtime_prefilter_limit(strategy)]
+    manager = _get_dsa_fetcher_manager()
+    try:
+        manager.prefetch_realtime_quotes(realtime_universe[:50])
+    except Exception as exc:  # noqa: BLE001 - prefetch should not block per-symbol quote fallback.
+        source_errors.append(f"prefetch_realtime_quotes_failed: {exc}")
+
+    quote_items: List[Tuple[float, str, Dict[str, Any]]] = []
+    for code in realtime_universe:
+        try:
+            try:
+                quote = get_dsa_realtime_quote(code, supplement=False)
+            except TypeError as exc:
+                if "supplement" not in str(exc):
+                    raise
+                quote = get_dsa_realtime_quote(code)
+        except Exception as exc:  # noqa: BLE001
+            source_errors.append(f"{code}: realtime_quote_failed: {exc}")
+            continue
+        if not isinstance(quote, dict) or _safe_float(quote.get("price")) is None:
+            source_errors.append(f"{code}: realtime_quote_missing")
+            continue
+        symbol_info = symbol_meta.get(code) or {}
+        if _env_text(symbol_info.get("asset_type")):
+            quote = {**quote, "asset_type": _env_text(symbol_info.get("asset_type"))}
+        amount = _safe_float(quote.get("amount"))
+        volume = _safe_float(quote.get("volume"))
+        price = _safe_float(quote.get("price")) or 0.0
+        if amount is None and volume is not None and price > 0:
+            amount = volume * price
+        liquidity_amount = _dsa_us_scoring_liquidity_amount(
+            quote=quote,
+            symbol_info=symbol_info,
+        )
+        pre_scores = _score_dsa_us_factors(
+            strategy=strategy,
+            quote=quote,
+            amount=liquidity_amount,
+            calibration=_neutral_dsa_us_analysis_calibration(reason="pre_rank_daily_calibration_deferred"),
+        )
+        quote_items.append((float(pre_scores.get("score") or 0.0), code, quote))
+
+    quote_items.sort(key=lambda item: item[0], reverse=True)
+    calibration_limit = min(
+        len(quote_items),
+        max(
+            DSA_US_DAILY_CALIBRATION_CANDIDATE_MIN,
+            min(_dsa_us_daily_calibration_candidate_max(strategy), max(1, int(max_results or 20)) * 4),
+        ),
+    )
+
+    candidates: List[Dict[str, Any]] = []
+    for _pre_score, code, quote in quote_items[:calibration_limit]:
+        calibration = _build_dsa_us_analysis_calibration(code=code, quote=quote)
+        if strategy == "dsa_us_short_swing_recovery" and not calibration.get("available"):
+            source_errors.append(
+                f"{code}: daily_calibration_insufficient: "
+                f"{int(_safe_float(calibration.get('bar_count')) or 0)}/{DSA_US_DAILY_CALIBRATION_MIN_BARS} bars"
+            )
+            continue
+        candidates.append(
+            _build_dsa_us_candidate(
+                code=code,
+                quote=quote,
+                strategy=strategy,
+                rank=len(candidates) + 1,
+                calibration=calibration,
+                symbol_info=symbol_meta.get(code) or {},
+            )
+        )
+
+    candidates.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+    intraday_limit = min(
+        len(candidates),
+        max(4, min(DSA_US_SHORT_SWING_INTRADAY_CANDIDATE_MAX, max(1, int(max_results or 20)))),
+    )
+    for index, item in enumerate(candidates[:intraday_limit]):
+        code = _env_text(item.get("code"))
+        intraday: Optional[Dict[str, Any]] = None
+        if hasattr(manager, "get_recent_intraday_price_action"):
+            try:
+                intraday = manager.get_recent_intraday_price_action(code, hours=24, interval_minutes=5)
+            except Exception as exc:  # noqa: BLE001 - intraday data is an optional ranking layer.
+                source_errors.append(f"{code}: recent_intraday_price_action_failed: {exc}")
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        candidates[index] = _build_dsa_us_candidate(
+            code=code,
+            quote=raw.get("quote") if isinstance(raw.get("quote"), dict) else {},
+            strategy=strategy,
+            rank=index + 1,
+            calibration=(
+                raw.get("daily_calibration")
+                if isinstance(raw.get("daily_calibration"), dict)
+                else _neutral_dsa_us_analysis_calibration()
+            ),
+            intraday=intraday,
+            symbol_info=symbol_meta.get(code) or {},
+        )
+
+    candidates.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+    for _coverage_pass in range(2):
+        preview, _notes = _select_dsa_us_diversified_candidates(candidates, limit=max_results)
+        missing_codes = []
+        for item in preview:
+            raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+            recent_intraday = raw.get("recent_intraday") if isinstance(raw.get("recent_intraday"), dict) else {}
+            if not isinstance(recent_intraday.get("summary"), dict):
+                missing_codes.append(_env_text(item.get("code")))
+        if not missing_codes or not hasattr(manager, "get_recent_intraday_price_action"):
+            break
+
+        fetched_any = False
+        for code in missing_codes:
+            try:
+                intraday = manager.get_recent_intraday_price_action(code, hours=24, interval_minutes=5)
+            except Exception as exc:  # noqa: BLE001
+                source_errors.append(f"{code}: recent_intraday_price_action_failed: {exc}")
+                continue
+            if not isinstance(intraday, dict) or not isinstance(intraday.get("summary"), dict):
+                continue
+            candidate_index = next(
+                (index for index, candidate in enumerate(candidates) if _env_text(candidate.get("code")) == code),
+                None,
+            )
+            if candidate_index is None:
+                continue
+            item = candidates[candidate_index]
+            raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+            candidates[candidate_index] = _build_dsa_us_candidate(
+                code=code,
+                quote=raw.get("quote") if isinstance(raw.get("quote"), dict) else {},
+                strategy=strategy,
+                rank=candidate_index + 1,
+                calibration=(
+                    raw.get("daily_calibration")
+                    if isinstance(raw.get("daily_calibration"), dict)
+                    else _neutral_dsa_us_analysis_calibration()
+                ),
+                intraday=intraday,
+                symbol_info=symbol_meta.get(code) or {},
+            )
+            fetched_any = True
+        candidates.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+        if not fetched_any:
+            break
+
+    for index, item in enumerate(candidates, 1):
+        item["rank"] = index
+    return candidates, source_errors
+
+
+def _select_dsa_us_diversified_candidates(
+    candidates: List[Dict[str, Any]],
+    *,
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    if limit <= 0 or not candidates:
+        return [], []
+    selected: List[Dict[str, Any]] = []
+    selected_codes: set[str] = set()
+    sector_counts: Dict[str, int] = {}
+    industry_counts: Dict[str, int] = {}
+    deferred = 0
+
+    for item in candidates:
+        if len(selected) >= limit:
+            break
+        code = _env_text(item.get("code"))
+        sector = _env_text(item.get("sector"))
+        industry = _env_text(item.get("industry"))
+        sector_key = sector if sector and sector != "未分类" else ""
+        industry_key = industry if industry and industry != "未分类" else ""
+        if sector_key and sector_counts.get(sector_key, 0) >= 5:
+            deferred += 1
+            continue
+        if industry_key and industry_counts.get(industry_key, 0) >= 3:
+            deferred += 1
+            continue
+        selected.append(dict(item))
+        selected_codes.add(code)
+        if sector_key:
+            sector_counts[sector_key] = sector_counts.get(sector_key, 0) + 1
+        if industry_key:
+            industry_counts[industry_key] = industry_counts.get(industry_key, 0) + 1
+
+    relaxed_fill = 0
+    for item in candidates:
+        if len(selected) >= limit:
+            break
+        code = _env_text(item.get("code"))
+        if code in selected_codes:
+            continue
+        selected.append(dict(item))
+        selected_codes.add(code)
+        relaxed_fill += 1
+
+    for index, item in enumerate(selected, 1):
+        item["rank"] = index
+    notes: List[str] = []
+    if deferred:
+        notes.append(f"行业分散规则暂缓了 {deferred} 个过度集中的高排名候选。")
+    if relaxed_fill:
+        notes.append(f"为补足返回数量，放宽行业上限补入 {relaxed_fill} 个候选。")
+    if not notes:
+        notes.append("返回结果未触发单行业 3 只、单板块 5 只的集中度上限。")
+    return selected, notes
+
+
+def _append_dsa_us_screen_history(
+    payload: Dict[str, Any],
+    *,
+    ranked_candidates: List[Dict[str, Any]],
+    prefiltered_symbols: List[str],
+) -> None:
+    history_path = _dsa_us_screen_history_path()
+    candidates: List[Dict[str, Any]] = []
+    for item in ranked_candidates:
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        calibration = raw.get("daily_calibration") if isinstance(raw.get("daily_calibration"), dict) else {}
+        intraday = raw.get("recent_intraday") if isinstance(raw.get("recent_intraday"), dict) else {}
+        candidates.append({
+            "rank": item.get("rank"),
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "score": item.get("score"),
+            "risk_level": item.get("risk_level"),
+            "risk_flags": item.get("risk_flags") or [],
+            "data_confidence": item.get("data_confidence"),
+            "asset_type": item.get("asset_type"),
+            "sector": item.get("sector"),
+            "industry": item.get("industry"),
+            "price": item.get("price"),
+            "change_pct": item.get("change_pct"),
+            "factor_scores": item.get("factor_scores") or {},
+            "daily_calibration": calibration,
+            "recent_intraday_summary": intraday.get("summary") if isinstance(intraday, dict) else None,
+        })
+    row = _remove_non_finite_json_values({
+        "recorded_at": _utc_now_iso(),
+        "run_id": payload.get("run_id"),
+        "strategy": payload.get("strategy"),
+        "market": payload.get("market"),
+        "snapshot_count": payload.get("snapshot_count"),
+        "eligible_count": payload.get("universe_eligible_count"),
+        "prefiltered_symbols": list(prefiltered_symbols),
+        "realtime_prefilter_count": payload.get("realtime_prefilter_count"),
+        "deep_score_limit": payload.get("deep_score_limit"),
+        "ranked_candidates": candidates,
+        "selected_codes": [item.get("code") for item in payload.get("candidates") or []],
+    })
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        with history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception as exc:  # noqa: BLE001 - history must never block a screen run.
+        logger.warning("Failed to append DSA US screen history to %s: %s", history_path, exc)
+
+
+def _dsa_us_realtime_prefilter_limit(strategy: str) -> int:
+    env_value = _safe_float(os.getenv("DSA_US_REALTIME_PREFILTER_LIMIT"))
+    if env_value is not None and env_value > 0:
+        return max(5, min(200, int(env_value)))
+    if strategy == "dsa_us_short_swing_recovery":
+        return DSA_US_SHORT_SWING_REALTIME_PREFILTER_LIMIT
+    return DSA_US_REALTIME_PREFILTER_LIMIT
+
+
+def _dsa_us_daily_calibration_candidate_max(strategy: str) -> int:
+    env_value = _safe_float(os.getenv("DSA_US_DAILY_CALIBRATION_CANDIDATE_MAX"))
+    if env_value is not None and env_value > 0:
+        return max(DSA_US_DAILY_CALIBRATION_CANDIDATE_MIN, min(100, int(env_value)))
+    if strategy == "dsa_us_short_swing_recovery":
+        return DSA_US_SHORT_SWING_DAILY_CALIBRATION_CANDIDATE_MAX
+    return DSA_US_DAILY_CALIBRATION_CANDIDATE_MAX
+
+
+def _build_dsa_us_candidate(
+    *,
+    code: str,
+    quote: Dict[str, Any],
+    strategy: str,
+    rank: int,
+    calibration: Optional[Dict[str, Any]] = None,
+    intraday: Optional[Dict[str, Any]] = None,
+    symbol_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    symbol_info = symbol_info or {}
+    quote = _merge_dsa_us_quote_with_intraday(quote, intraday)
+    asset_type = _env_text(symbol_info.get("asset_type")) or _env_text(quote.get("asset_type")) or "stock"
+    quote["asset_type"] = asset_type
+    price = _safe_float(quote.get("price")) or 0.0
+    change_pct = _safe_float(quote.get("change_pct")) or 0.0
+    amount = _safe_float(quote.get("amount"))
+    volume = _safe_float(quote.get("volume"))
+    if amount is None and volume is not None and price > 0:
+        amount = volume * price
+    market_session = _env_text(quote.get("market_session")) or "unknown"
+    source = _env_text(quote.get("source")) or "dsa"
+    calibration = calibration or _neutral_dsa_us_analysis_calibration(reason="daily_calibration_not_requested")
+    liquidity_amount = _dsa_us_scoring_liquidity_amount(quote=quote, symbol_info=symbol_info)
+    data_confidence, data_warnings = _calculate_dsa_us_data_confidence(
+        quote=quote,
+        amount=amount,
+        calibration=calibration,
+        intraday=intraday,
+    )
+    factor_scores = _score_dsa_us_factors(
+        strategy=strategy,
+        quote=quote,
+        amount=liquidity_amount,
+        calibration=calibration,
+        intraday=intraday,
+        data_confidence=data_confidence,
+    )
+    score = factor_scores.pop("score")
+    reason = _build_dsa_us_reason(
+        strategy=strategy,
+        quote=quote,
+        score=score,
+        amount=amount,
+        calibration=calibration,
+        intraday=intraday,
+    )
+    name = (
+        _env_text(quote.get("name"))
+        or _env_text(symbol_info.get("name"))
+        or DSA_US_DEFAULT_NAMES.get(code, code)
+    )
+    sector = _env_text(symbol_info.get("sector")) or "未分类"
+    industry = _env_text(symbol_info.get("industry")) or sector
+    return {
+        "rank": rank,
+        "code": code,
+        "name": name,
+        "score": round(score, 2),
+        "screen_score": round(score, 2),
+        "reason": reason,
+        "risk_level": _dsa_us_risk_level(
+            quote,
+            calibration=calibration,
+            intraday=intraday,
+            data_confidence=data_confidence,
+        ),
+        "risk_flags": _dsa_us_risk_flags(
+            quote,
+            calibration=calibration,
+            intraday=intraday,
+            data_confidence=data_confidence,
+        ),
+        "data_confidence": round(data_confidence, 1),
+        "data_warnings": data_warnings,
+        "asset_type": asset_type,
+        "price": price,
+        "change_pct": change_pct,
+        "amount": amount,
+        "sector": sector,
+        "industry": industry,
+        "country": _env_text(symbol_info.get("country")),
+        "factor_scores": factor_scores,
+        "dsa_context": {
+            "enriched": True,
+            "profile": "dsa_us_pre_rank",
+            "quote": quote,
+            "fundamentals": {},
+            "news": {"success": False, "skipped": True, "reason": "pre_rank_realtime_screen", "results": []},
+            "daily_calibration": calibration,
+            "recent_intraday": intraday or {},
+            "warnings": _dedupe_strings([*(calibration.get("warnings") or []), *data_warnings]),
+        },
+        "dsa_analysis_summary": _build_dsa_analysis_summary({}, quote, {}, {"results": []}),
+        "raw": {
+            "code": code,
+            "name": name,
+            "strategy": strategy,
+            "market": "us",
+            "asset_type": asset_type,
+            "price": price,
+            "change_pct": change_pct,
+            "amount": amount,
+            "liquidity_amount": liquidity_amount,
+            "price_source": source,
+            "price_session": market_session,
+            "provider_timestamp": quote.get("provider_timestamp"),
+            "quote": quote,
+            "factor_scores": factor_scores,
+            "daily_calibration": calibration,
+            "recent_intraday": intraday or {},
+            "symbol_info": symbol_info,
+            "data_confidence": round(data_confidence, 1),
+            "data_warnings": data_warnings,
+        },
+    }
+
+
+def _neutral_dsa_us_analysis_calibration(*, reason: str = "") -> Dict[str, Any]:
+    warnings = [reason] if reason else []
+    return {
+        "available": False,
+        "source": "",
+        "bar_count": 0,
+        "technical_score": 50.0,
+        "quality_gate": 0.0,
+        "score_cap": None,
+        "valuation_penalty": 0.0,
+        "ma_alignment": "unknown",
+        "above_ma_count": 0,
+        "price_vs_ma5_pct": None,
+        "price_vs_ma10_pct": None,
+        "price_vs_ma20_pct": None,
+        "change_20d_pct": None,
+        "change_60d_pct": None,
+        "drawdown_60d_pct": None,
+        "warnings": warnings,
+    }
+
+
+def _build_dsa_us_analysis_calibration(*, code: str, quote: Dict[str, Any]) -> Dict[str, Any]:
+    normalized, source, cache_used, error = _load_dsa_us_daily_history_for_calibration(code)
+    if error:
+        return _neutral_dsa_us_analysis_calibration(reason=error)
+    if normalized is None or normalized.empty:
+        return _neutral_dsa_us_analysis_calibration(reason="daily_calibration_empty")
+    if len(normalized) < DSA_US_DAILY_CALIBRATION_MIN_BARS:
+        calibration = _neutral_dsa_us_analysis_calibration(reason="daily_calibration_insufficient_bars")
+        calibration["source"] = _env_text(source)
+        calibration["bar_count"] = int(len(normalized))
+        calibration["cache_used"] = cache_used
+        return calibration
+
+    calibration = _calculate_dsa_us_daily_calibration(code=code, quote=quote, daily_df=normalized, source=_env_text(source))
+    calibration["cache_used"] = cache_used
+    return calibration
+
+
+def _load_dsa_us_daily_history_for_calibration(code: str) -> Tuple[Any, str, bool, str]:
+    cache_key = _normalize_us_screen_symbol(code) or _env_text(code).upper()
+    now = time.time()
+    if cache_key:
+        with _DSA_US_DAILY_HISTORY_CACHE_LOCK:
+            cached = _DSA_US_DAILY_HISTORY_CACHE.get(cache_key)
+            if cached and now - cached[0] <= DSA_US_DAILY_HISTORY_CACHE_TTL_SECONDS:
+                cached_df, cached_source = cached[1], cached[2]
+                return cached_df.copy(), cached_source, True, ""
+
+    try:
+        manager = _get_dsa_fetcher_manager()
+    except Exception as exc:  # noqa: BLE001
+        return None, "", False, f"daily_calibration_manager_unavailable: {exc}"
+
+    get_daily_data = getattr(manager, "get_daily_data", None)
+    if not callable(get_daily_data):
+        return None, "", False, "daily_calibration_manager_missing_get_daily_data"
+
+    try:
+        raw_df, source = get_daily_data(code, days=DSA_US_DAILY_CALIBRATION_LOOKBACK_DAYS)
+    except Exception as exc:  # noqa: BLE001
+        return None, "", False, f"daily_calibration_fetch_failed: {exc}"
+
+    normalized = _normalize_dsa_daily_history(raw_df)
+    source_text = _env_text(source)
+    if cache_key and normalized is not None and not normalized.empty:
+        with _DSA_US_DAILY_HISTORY_CACHE_LOCK:
+            _DSA_US_DAILY_HISTORY_CACHE[cache_key] = (now, normalized.copy(), source_text)
+    return normalized, source_text, False, ""
+
+
+def _calculate_dsa_us_daily_calibration(
+    *,
+    code: str,
+    quote: Dict[str, Any],
+    daily_df: Any,
+    source: str,
+) -> Dict[str, Any]:
+    df = daily_df.copy()
+    if "date" in df.columns:
+        df = df.sort_values("date")
+    df = df.reset_index(drop=True)
+
+    closes = df["close"].astype(float)
+    current_price = _safe_float(quote.get("price")) or float(closes.iloc[-1])
+    ma5 = _rolling_tail_mean(closes, 5)
+    ma10 = _rolling_tail_mean(closes, 10)
+    ma20 = _rolling_tail_mean(closes, 20)
+    ma60 = _rolling_tail_mean(closes, 60)
+    if ma60 is None:
+        ma60 = ma20
+
+    price_vs_ma5 = _pct_delta(current_price, ma5)
+    price_vs_ma10 = _pct_delta(current_price, ma10)
+    price_vs_ma20 = _pct_delta(current_price, ma20)
+    change_5d = _pct_delta(current_price, float(closes.iloc[-5])) if len(closes) >= 5 else None
+    change_10d = _pct_delta(current_price, float(closes.iloc[-10])) if len(closes) >= 10 else None
+    change_20d = _pct_delta(current_price, float(closes.iloc[-20])) if len(closes) >= 20 else None
+    change_60d = _pct_delta(current_price, float(closes.iloc[-60])) if len(closes) >= 60 else None
+
+    high_series = df["high"].astype(float) if "high" in df.columns else closes
+    high_20 = float(high_series.tail(min(20, len(high_series))).max())
+    high_60 = float(high_series.tail(min(60, len(high_series))).max())
+    drawdown_20d = max(0.0, (high_20 - current_price) / high_20 * 100.0) if high_20 > 0 else None
+    drawdown_60d = max(0.0, (high_60 - current_price) / high_60 * 100.0) if high_60 > 0 else None
+
+    ma_values = (ma5, ma10, ma20)
+    if all(value is not None for value in ma_values) and ma5 > ma10 > ma20:
+        ma_alignment = "bullish"
+    elif all(value is not None for value in ma_values) and ma5 < ma10 < ma20:
+        ma_alignment = "bearish"
+    else:
+        ma_alignment = "mixed"
+
+    above_ma_count = sum(
+        1
+        for value in (ma5, ma10, ma20, ma60)
+        if value is not None and current_price >= value
+    )
+
+    technical_score = 50.0
+    ma_weights = ((ma5, 8.0), (ma10, 8.0), (ma20, 10.0), (ma60, 6.0))
+    for ma_value, weight in ma_weights:
+        if ma_value is None:
+            continue
+        technical_score += weight if current_price >= ma_value else -weight * 0.75
+    if ma_alignment == "bullish":
+        technical_score += 10.0
+    elif ma_alignment == "bearish":
+        technical_score -= 12.0
+    technical_score += _clamp_float((change_20d or 0.0) * 0.9, -12.0, 12.0)
+    technical_score += _clamp_float((change_60d or 0.0) * 0.35, -8.0, 8.0)
+    if drawdown_60d is not None and drawdown_60d >= 12.0:
+        technical_score -= min(12.0, (drawdown_60d - 8.0) * 0.7)
+    if price_vs_ma20 is not None and price_vs_ma20 >= 15.0:
+        technical_score -= min(8.0, (price_vs_ma20 - 12.0) * 0.5)
+
+    pe_ratio = _safe_float(quote.get("pe_ratio"))
+    valuation_penalty = 0.0
+    if pe_ratio is not None and pe_ratio > 80.0:
+        valuation_penalty = min(16.0, (pe_ratio - 80.0) / 18.0)
+        technical_score -= valuation_penalty * 0.45
+
+    technical_score = _clamp_float(technical_score, 1.0, 99.0)
+    session = _env_text(quote.get("market_session"))
+    change_pct = abs(_safe_float(quote.get("change_pct")) or 0.0)
+
+    quality_gate = (technical_score - 50.0) * 0.55
+    if above_ma_count <= 1:
+        quality_gate -= 7.0
+    if price_vs_ma20 is not None and price_vs_ma20 < 0:
+        quality_gate -= 8.0
+    if ma_alignment == "bearish":
+        quality_gate -= 8.0
+    if session in DSA_US_EXTENDED_SESSIONS and change_pct < 0.8 and technical_score < 62.0:
+        quality_gate -= 6.0
+    quality_gate -= valuation_penalty
+    quality_gate = _clamp_float(quality_gate, -30.0, 18.0)
+
+    score_cap: Optional[float] = None
+
+    def cap_at(value: float) -> None:
+        nonlocal score_cap
+        score_cap = value if score_cap is None else min(score_cap, value)
+
+    if technical_score < 40.0:
+        cap_at(50.0)
+    elif technical_score < 45.0:
+        cap_at(54.0)
+    elif technical_score < 50.0:
+        cap_at(58.0)
+    elif technical_score < 55.0:
+        cap_at(63.0)
+    if price_vs_ma20 is not None and price_vs_ma20 < 0:
+        cap_at(58.0 if (price_vs_ma10 is not None and price_vs_ma10 < 0) else 62.0)
+    if ma_alignment == "bearish":
+        cap_at(58.0)
+    if pe_ratio is not None and pe_ratio >= 250.0 and technical_score < 65.0:
+        cap_at(62.0)
+    if session in DSA_US_EXTENDED_SESSIONS and change_pct < 0.8 and technical_score < 62.0:
+        cap_at(64.0)
+
+    return _remove_non_finite_json_values({
+        "available": True,
+        "source": source,
+        "bar_count": int(len(df)),
+        "technical_score": round(technical_score, 2),
+        "quality_gate": round(quality_gate, 2),
+        "score_cap": round(score_cap, 2) if score_cap is not None else None,
+        "valuation_penalty": round(valuation_penalty, 2),
+        "ma_alignment": ma_alignment,
+        "above_ma_count": int(above_ma_count),
+        "price_vs_ma5_pct": _round_optional(price_vs_ma5),
+        "price_vs_ma10_pct": _round_optional(price_vs_ma10),
+        "price_vs_ma20_pct": _round_optional(price_vs_ma20),
+        "change_5d_pct": _round_optional(change_5d),
+        "change_10d_pct": _round_optional(change_10d),
+        "change_20d_pct": _round_optional(change_20d),
+        "change_60d_pct": _round_optional(change_60d),
+        "drawdown_20d_pct": _round_optional(drawdown_20d),
+        "drawdown_60d_pct": _round_optional(drawdown_60d),
+        "warnings": [],
+    })
+
+
+def _rolling_tail_mean(series: Any, window: int) -> Optional[float]:
+    if len(series) < window:
+        return None
+    value = series.tail(window).mean()
+    return _safe_float(value)
+
+
+def _pct_delta(value: Optional[float], base: Optional[float]) -> Optional[float]:
+    value_float = _safe_float(value)
+    base_float = _safe_float(base)
+    if value_float is None or base_float is None or base_float == 0:
+        return None
+    return (value_float - base_float) / base_float * 100.0
+
+
+def _clamp_float(value: float, lower: float, upper: float) -> float:
+    return min(upper, max(lower, float(value)))
+
+
+def _round_optional(value: Optional[float], digits: int = 2) -> Optional[float]:
+    number = _safe_float(value)
+    if number is None:
+        return None
+    return round(number, digits)
+
+
+def _calculate_dsa_us_data_confidence(
+    *,
+    quote: Dict[str, Any],
+    amount: Optional[float],
+    calibration: Dict[str, Any],
+    intraday: Optional[Dict[str, Any]],
+) -> Tuple[float, List[str]]:
+    score = 15.0 if _safe_float(quote.get("price")) is not None else 0.0
+    warnings: List[str] = []
+    if quote.get("provider_timestamp"):
+        score += 12.0
+    else:
+        warnings.append("quote_timestamp_missing")
+
+    stale_state = quote.get("is_stale")
+    if stale_state is False:
+        score += 15.0
+    elif stale_state is True:
+        warnings.append("stale_quote")
+    else:
+        score += 4.0
+        warnings.append("quote_freshness_unknown")
+
+    amount_value = max(float(amount or 0.0), 0.0)
+    if amount_value >= 20_000_000:
+        score += 10.0
+    elif amount_value >= 5_000_000:
+        score += 7.0
+    elif amount_value > 0:
+        score += 3.0
+    else:
+        warnings.append("session_turnover_missing")
+
+    if _safe_float(quote.get("volume_ratio")) is not None:
+        score += 8.0
+    else:
+        warnings.append("volume_ratio_missing")
+    if _env_text(quote.get("asset_type")) == "etf":
+        score += 8.0
+    elif _safe_float(quote.get("pe_ratio")) is not None:
+        score += 8.0
+    else:
+        warnings.append("valuation_missing")
+
+    if calibration.get("available"):
+        score += 20.0
+    else:
+        warnings.append("daily_calibration_missing")
+
+    intraday_summary = intraday.get("summary") if isinstance(intraday, dict) else None
+    if isinstance(intraday_summary, dict):
+        score += 12.0
+        if int(_safe_float(intraday.get("bar_count")) or 0) >= 24:
+            score += 4.0
+    else:
+        warnings.append("recent_24h_trend_missing")
+
+    return _clamp_float(score, 0.0, 100.0), _dedupe_strings(warnings)
+
+
+def _score_dsa_us_recent_intraday(
+    intraday: Dict[str, Any],
+    *,
+    strategy: str,
+) -> Dict[str, float]:
+    summary = intraday.get("summary") if isinstance(intraday, dict) else None
+    if not isinstance(summary, dict):
+        return {
+            "recent_24h_available": 0.0,
+            "recent_24h_adjustment": 0.0,
+            "recent_24h_cap": 0.0,
+            "intraday_1h_change": 0.0,
+            "intraday_4h_change": 0.0,
+            "intraday_12h_change": 0.0,
+            "intraday_24h_change": 0.0,
+            "intraday_vwap_position": 0.0,
+            "intraday_chase_penalty": 0.0,
+        }
+
+    windows = summary.get("window_changes") if isinstance(summary.get("window_changes"), dict) else {}
+
+    def window_change(key: str) -> float:
+        payload = windows.get(key) if isinstance(windows.get(key), dict) else {}
+        return float(_safe_float(payload.get("change_pct")) or 0.0)
+
+    change_1h = window_change("1h")
+    change_4h = window_change("4h")
+    change_12h = window_change("12h")
+    change_24h = window_change("24h")
+    if not windows:
+        change_24h = float(_safe_float(summary.get("change_pct")) or 0.0)
+
+    weighted_trend = _clamp_float(
+        change_1h * 1.1 + change_4h * 0.75 + change_12h * 0.3 + change_24h * 0.15,
+        -10.0,
+        10.0,
+    )
+    last_price = _safe_float(summary.get("last_price"))
+    vwap = _safe_float(summary.get("vwap"))
+    vwap_position = 0.0
+    if last_price is not None and vwap is not None and vwap > 0:
+        vwap_position = _clamp_float((last_price - vwap) / vwap * 100.0, -3.0, 3.0)
+
+    rebound = _safe_float(summary.get("rebound_from_low_pct")) or 0.0
+    drawdown = _safe_float(summary.get("drawdown_from_high_pct")) or 0.0
+    structure_adjustment = 0.0
+    if 0.5 <= rebound <= 4.0 and drawdown >= -2.5:
+        structure_adjustment += 2.0
+    if drawdown < -3.0:
+        structure_adjustment -= min(5.0, abs(drawdown) * 0.8)
+    if vwap_position > 0:
+        structure_adjustment += min(2.0, vwap_position)
+    elif vwap_position < -1.0:
+        structure_adjustment -= min(3.0, abs(vwap_position))
+
+    chase_penalty = 0.0
+    if strategy == "dsa_us_short_swing_recovery":
+        chase_penalty += max(0.0, change_4h - 3.0) * 1.4
+        chase_penalty += max(0.0, change_24h - 5.0) * 1.6
+    adjustment = _clamp_float(weighted_trend + structure_adjustment - chase_penalty, -12.0, 10.0)
+
+    score_cap = 0.0
+    if change_24h <= -5.0 or change_4h <= -4.0:
+        score_cap = 58.0
+    elif strategy == "dsa_us_short_swing_recovery" and change_24h > 8.0:
+        score_cap = 66.0
+    elif strategy == "dsa_us_short_swing_recovery" and (change_24h > 5.0 or change_4h > 4.0):
+        score_cap = 76.0
+
+    return {
+        "recent_24h_available": 1.0,
+        "recent_24h_adjustment": round(adjustment, 3),
+        "recent_24h_cap": round(score_cap, 3),
+        "intraday_1h_change": round(change_1h, 3),
+        "intraday_4h_change": round(change_4h, 3),
+        "intraday_12h_change": round(change_12h, 3),
+        "intraday_24h_change": round(change_24h, 3),
+        "intraday_vwap_position": round(vwap_position, 3),
+        "intraday_chase_penalty": round(chase_penalty, 3),
+    }
+
+
+def _score_dsa_us_factors(
+    *,
+    strategy: str,
+    quote: Dict[str, Any],
+    amount: Optional[float],
+    calibration: Optional[Dict[str, Any]] = None,
+    intraday: Optional[Dict[str, Any]] = None,
+    data_confidence: float = 0.0,
+) -> Dict[str, float]:
+    change_pct = _safe_float(quote.get("change_pct")) or 0.0
+    volume_ratio = _safe_float(quote.get("volume_ratio"))
+    amount_value = max(float(amount or 0.0), 0.0)
+    liquidity = min(20.0, max(0.0, math.log10(amount_value + 1.0) * 2.0))
+    session = _env_text(quote.get("market_session"))
+    session_bonus = 4.0 if session in {"pre_market", "post_market", "overnight"} else 1.5 if session == "regular" else 0.0
+    stale_state = quote.get("is_stale")
+    freshness = 8.0 if stale_state is False else -8.0 if stale_state is True else 2.0
+    volume_signal = min(8.0, max(0.0, volume_ratio * 2.0)) if volume_ratio is not None else 0.0
+    extra_scores: Dict[str, float] = {}
+    strategy_score_cap: Optional[float] = None
+    if strategy == "dsa_us_pullback_watchlist":
+        pullback_fit = max(0.0, 10.0 - abs(change_pct + 1.8) * 3.0)
+        score = 45.0 + pullback_fit * 2.2 + liquidity * 0.8 + freshness - max(change_pct, 0.0) * 1.5
+        strategy_fit = pullback_fit
+    elif strategy == "dsa_us_short_swing_recovery":
+        setup_scores = _score_dsa_us_short_swing_setup(
+            quote=quote,
+            amount=amount,
+            calibration=calibration or {},
+        )
+        strategy_fit = setup_scores["short_swing_setup"]
+        strategy_score_cap = setup_scores.get("short_swing_cap") or None
+        extra_scores.update(setup_scores)
+        score = (
+            36.0
+            + liquidity * 1.1
+            + freshness
+            + volume_signal * 0.6
+            + setup_scores["short_swing_setup"]
+            + setup_scores["extended_session_rebound"]
+            + setup_scores["fundamental_quality"]
+        )
+    elif strategy == "dsa_us_balanced_realtime":
+        balanced_change = max(-4.0, min(change_pct, 6.0))
+        stability = max(0.0, 10.0 - abs(change_pct) * 1.2)
+        score = 48.0 + balanced_change * 2.2 + stability + liquidity * 0.9 + freshness + session_bonus
+        strategy_fit = stability
+    else:
+        momentum = max(0.0, change_pct) * 4.5
+        score = 42.0 + momentum + liquidity + freshness + session_bonus + volume_signal
+        strategy_fit = momentum
+    calibration = calibration or _neutral_dsa_us_analysis_calibration()
+    technical_score = _safe_float(calibration.get("technical_score")) or 50.0
+    quality_gate = _safe_float(calibration.get("quality_gate")) or 0.0
+    valuation_penalty = _safe_float(calibration.get("valuation_penalty")) or 0.0
+    if strategy == "dsa_us_short_swing_recovery":
+        technical_weight = 0.14
+        quality_gate_weight = 0.6
+    else:
+        technical_weight = 0.2 if strategy == "dsa_us_pullback_watchlist" else 0.28
+        quality_gate_weight = 1.0
+    technical_adjustment = (technical_score - 50.0) * technical_weight
+    intraday_scores = _score_dsa_us_recent_intraday(intraday or {}, strategy=strategy)
+    confidence_adjustment = _clamp_float((float(data_confidence or 0.0) - 70.0) * 0.18, -9.0, 4.0)
+    score += (
+        technical_adjustment
+        + quality_gate * quality_gate_weight
+        + intraday_scores["recent_24h_adjustment"]
+        + confidence_adjustment
+    )
+    score_cap = _safe_float(calibration.get("score_cap"))
+    if score_cap is not None:
+        score = min(score, score_cap)
+    if strategy_score_cap is not None:
+        score = min(score, strategy_score_cap)
+    intraday_score_cap = _safe_float(intraday_scores.get("recent_24h_cap"))
+    if intraday_score_cap is not None and intraday_score_cap > 0:
+        score = min(score, intraday_score_cap)
+    realtime_momentum_cap = 0.0
+    extended_session_cap = 0.0
+    if strategy == "dsa_us_realtime_momentum":
+        if change_pct <= 0.0:
+            realtime_momentum_cap = 72.0
+        elif change_pct < 0.3:
+            realtime_momentum_cap = 84.0
+        elif change_pct < 0.8:
+            realtime_momentum_cap = 92.0
+        if realtime_momentum_cap:
+            score = min(score, realtime_momentum_cap)
+    elif strategy == "dsa_us_short_swing_recovery" and session in DSA_US_EXTENDED_SESSIONS:
+        if change_pct < -0.5:
+            extended_session_cap = max(58.0, 76.0 + (change_pct + 0.5) * 8.0)
+        elif change_pct < 0.2:
+            extended_session_cap = 76.0 + (change_pct + 0.5) * (12.0 / 0.7)
+        elif change_pct < 0.8:
+            extended_session_cap = 88.0 + (change_pct - 0.2) * (4.0 / 0.6)
+        elif change_pct < 1.5:
+            extended_session_cap = 92.0 - (change_pct - 0.8) * (7.0 / 0.7)
+        elif change_pct < 2.5:
+            extended_session_cap = 85.0 - (change_pct - 1.5) * 3.0
+        else:
+            extended_session_cap = 82.0
+        if extended_session_cap:
+            score = min(score, extended_session_cap)
+    score = min(99.0, max(1.0, score))
+    return {
+        "score": score,
+        "realtime_change": round(change_pct, 3),
+        "liquidity": round(liquidity, 3),
+        "freshness": round(freshness, 3),
+        "session_bonus": round(session_bonus, 3),
+        "volume_signal": round(volume_signal, 3),
+        "data_confidence": round(float(data_confidence or 0.0), 3),
+        "confidence_adjustment": round(confidence_adjustment, 3),
+        "strategy_fit": round(strategy_fit, 3),
+        "technical_score": round(technical_score, 3),
+        "technical_adjustment": round(technical_adjustment, 3),
+        "quality_gate": round(quality_gate, 3),
+        "valuation_penalty": round(valuation_penalty, 3),
+        "score_cap": round(score_cap, 3) if score_cap is not None else 0.0,
+        "realtime_momentum_cap": round(realtime_momentum_cap, 3),
+        "extended_session_cap": round(extended_session_cap, 3),
+        "strategy_score_cap": round(strategy_score_cap, 3) if strategy_score_cap is not None else 0.0,
+        **intraday_scores,
+        **extra_scores,
+    }
+
+
+def _score_dsa_us_short_swing_setup(
+    *,
+    quote: Dict[str, Any],
+    amount: Optional[float],
+    calibration: Dict[str, Any],
+) -> Dict[str, float]:
+    change_pct = _safe_float(quote.get("change_pct")) or 0.0
+    session = _env_text(quote.get("market_session"))
+    amount_value = max(float(amount or 0.0), 0.0)
+    technical_score = _safe_float(calibration.get("technical_score")) or 50.0
+    drawdown_60d = _safe_float(calibration.get("drawdown_60d_pct"))
+    change_5d = _safe_float(calibration.get("change_5d_pct"))
+    change_10d = _safe_float(calibration.get("change_10d_pct"))
+    price_vs_ma20 = _safe_float(calibration.get("price_vs_ma20_pct"))
+    ma_alignment = _env_text(calibration.get("ma_alignment"))
+    pe_ratio = _safe_float(quote.get("pe_ratio"))
+    is_etf = _env_text(quote.get("asset_type")) == "etf"
+
+    liquidity_gate = 0.0
+    if amount_value >= 50_000_000:
+        liquidity_gate = 8.0
+    elif amount_value >= 20_000_000:
+        liquidity_gate = 5.0
+    elif amount_value >= 5_000_000:
+        liquidity_gate = 1.0
+    else:
+        liquidity_gate = -14.0
+
+    fundamental_quality = 0.0 if is_etf else -4.0
+    if not is_etf and pe_ratio is not None:
+        if pe_ratio <= 0:
+            fundamental_quality = -8.0
+        elif pe_ratio <= 60:
+            fundamental_quality = 7.0
+        elif pe_ratio <= 120:
+            fundamental_quality = 3.0
+        elif pe_ratio <= 250:
+            fundamental_quality = -5.0
+        else:
+            fundamental_quality = -14.0
+
+    pullback_setup = 0.0
+    near_high_penalty = 0.0
+    falling_knife_penalty = 0.0
+    if drawdown_60d is not None:
+        if drawdown_60d < 1.5:
+            near_high_penalty = -14.0
+        elif drawdown_60d < 3.0:
+            near_high_penalty = -5.0
+        elif drawdown_60d <= 12.0:
+            pullback_setup += 12.0
+        elif drawdown_60d <= 22.0:
+            pullback_setup += 6.0 if technical_score >= 55.0 else -5.0
+        else:
+            falling_knife_penalty = -14.0
+
+    recent_dip_score = 0.0
+    if change_5d is not None:
+        if -8.0 <= change_5d <= -1.0:
+            recent_dip_score += 10.0
+        elif -12.0 <= change_5d < -8.0:
+            recent_dip_score += 3.0
+        elif change_5d < -12.0:
+            recent_dip_score -= 12.0
+        elif change_5d > 10.0:
+            recent_dip_score -= 18.0
+        elif change_5d > 6.0:
+            recent_dip_score -= 12.0
+    if change_10d is not None:
+        if -10.0 <= change_10d <= -2.0:
+            recent_dip_score += 5.0
+        elif change_10d > 18.0:
+            recent_dip_score -= 16.0
+        elif change_10d > 10.0:
+            recent_dip_score -= 10.0
+
+    trend_resilience = 0.0
+    if technical_score >= 70.0:
+        trend_resilience += 8.0
+    elif technical_score >= 58.0:
+        trend_resilience += 5.0
+    elif technical_score < 45.0:
+        trend_resilience -= 14.0
+    if ma_alignment == "bullish":
+        trend_resilience += 5.0
+    elif ma_alignment == "bearish":
+        trend_resilience -= 10.0
+    if price_vs_ma20 is not None:
+        if -3.0 <= price_vs_ma20 <= 6.0:
+            trend_resilience += 7.0
+        elif price_vs_ma20 < -6.0:
+            trend_resilience -= 12.0
+        elif price_vs_ma20 > 10.0:
+            trend_resilience -= 8.0
+
+    extended_rebound = 0.0
+    if session in DSA_US_EXTENDED_SESSIONS:
+        if change_pct >= 0.2:
+            extended_rebound = min(8.0, change_pct * 5.0)
+        elif change_pct < -0.5:
+            extended_rebound = max(-10.0, change_pct * 5.0)
+    elif change_pct > 0:
+        extended_rebound = min(6.0, change_pct * 3.0)
+
+    short_swing_setup = _clamp_float(
+        liquidity_gate
+        + pullback_setup
+        + recent_dip_score
+        + trend_resilience
+        + near_high_penalty
+        + falling_knife_penalty,
+        -35.0,
+        42.0,
+    )
+
+    short_swing_cap: Optional[float] = None
+
+    def cap_at(value: float) -> None:
+        nonlocal short_swing_cap
+        short_swing_cap = value if short_swing_cap is None else min(short_swing_cap, value)
+
+    if amount_value < 5_000_000:
+        cap_at(58.0)
+    if drawdown_60d is not None and drawdown_60d < 1.5:
+        cap_at(64.0)
+    if drawdown_60d is not None and drawdown_60d > 24.0:
+        cap_at(58.0)
+    if technical_score < 45.0:
+        cap_at(56.0)
+    if price_vs_ma20 is not None and price_vs_ma20 < -6.0:
+        cap_at(58.0)
+    if pe_ratio is not None and pe_ratio >= 250.0 and technical_score < 70.0:
+        cap_at(62.0)
+    if pe_ratio is None and not is_etf:
+        cap_at(82.0)
+    if change_5d is not None and change_5d > 10.0:
+        cap_at(64.0)
+    elif change_5d is not None and change_5d > 6.0:
+        cap_at(72.0)
+    if change_10d is not None and change_10d > 18.0:
+        cap_at(62.0)
+    elif change_10d is not None and change_10d > 10.0:
+        cap_at(70.0)
+
+    return {
+        "short_swing_setup": round(short_swing_setup, 3),
+        "liquidity_gate": round(liquidity_gate, 3),
+        "fundamental_quality": round(fundamental_quality, 3),
+        "pullback_setup": round(pullback_setup, 3),
+        "recent_dip_score": round(recent_dip_score, 3),
+        "trend_resilience": round(trend_resilience, 3),
+        "near_high_penalty": round(near_high_penalty, 3),
+        "falling_knife_penalty": round(falling_knife_penalty, 3),
+        "extended_session_rebound": round(extended_rebound, 3),
+        "short_swing_cap": round(short_swing_cap, 3) if short_swing_cap is not None else 0.0,
+    }
+
+
+def _build_dsa_us_reason(
+    *,
+    strategy: str,
+    quote: Dict[str, Any],
+    score: float,
+    amount: Optional[float],
+    calibration: Optional[Dict[str, Any]] = None,
+    intraday: Optional[Dict[str, Any]] = None,
+) -> str:
+    change_pct = _safe_float(quote.get("change_pct")) or 0.0
+    price = _safe_float(quote.get("price")) or 0.0
+    session = _env_text(quote.get("market_session")) or "unknown"
+    source = _env_text(quote.get("source")) or "dsa"
+    amount_text = f"，成交额约 {amount:.0f}" if amount else ""
+    if strategy == "dsa_us_pullback_watchlist":
+        style = "轻度回踩观察"
+    elif strategy == "dsa_us_short_swing_recovery":
+        style = "短线回踩修复"
+    elif strategy == "dsa_us_balanced_realtime":
+        style = "实时均衡观察"
+    else:
+        style = "实时动量观察"
+    stale_text = "，行情可能偏旧" if quote.get("is_stale") else ""
+    intraday_confirmed_text = "，现价已由最新5分钟K线校验" if quote.get("price_context") == "recent_intraday_5m" else ""
+    calibration_text = _build_dsa_us_calibration_reason(calibration or {})
+    short_swing_text = _build_dsa_us_short_swing_reason(calibration or {}) if strategy == "dsa_us_short_swing_recovery" else ""
+    intraday_text = _build_dsa_us_intraday_reason(intraday or {})
+    return (
+        f"{style}：{source} {session} 行情显示现价 {price:.2f}，"
+        f"实时涨跌幅 {change_pct:.2f}%{amount_text}，综合评分 {score:.1f}{stale_text}{intraday_confirmed_text}"
+        f"{calibration_text}{short_swing_text}{intraday_text}。"
+    )
+
+
+def _build_dsa_us_calibration_reason(calibration: Dict[str, Any]) -> str:
+    if not calibration.get("available"):
+        return "；日线校准暂不可用"
+    technical_score = _safe_float(calibration.get("technical_score"))
+    alignment = _env_text(calibration.get("ma_alignment"))
+    price_vs_ma20 = _safe_float(calibration.get("price_vs_ma20_pct"))
+    score_cap = _safe_float(calibration.get("score_cap"))
+    quality_gate = _safe_float(calibration.get("quality_gate")) or 0.0
+    parts = []
+    if technical_score is not None:
+        parts.append(f"日线技术分 {technical_score:.0f}")
+    if alignment and alignment != "unknown":
+        alignment_text = {"bullish": "多头排列", "bearish": "空头排列", "mixed": "均线混合"}.get(alignment, alignment)
+        parts.append(alignment_text)
+    if price_vs_ma20 is not None:
+        parts.append(f"较 MA20 {price_vs_ma20:+.1f}%")
+    if quality_gate < -3.0:
+        parts.append(f"已降权 {abs(quality_gate):.0f}")
+    elif quality_gate > 3.0:
+        parts.append(f"已加权 {quality_gate:.0f}")
+    if score_cap is not None:
+        parts.append(f"弱势封顶 {score_cap:.0f}")
+    return "；" + "，".join(parts) if parts else ""
+
+
+def _build_dsa_us_short_swing_reason(calibration: Dict[str, Any]) -> str:
+    if not calibration.get("available"):
+        return ""
+    drawdown_60d = _safe_float(calibration.get("drawdown_60d_pct"))
+    change_5d = _safe_float(calibration.get("change_5d_pct"))
+    change_10d = _safe_float(calibration.get("change_10d_pct"))
+    parts = []
+    if drawdown_60d is not None:
+        parts.append(f"距60日高点回撤 {drawdown_60d:.1f}%")
+    if change_5d is not None:
+        parts.append(f"5日涨跌 {change_5d:+.1f}%")
+    if change_10d is not None:
+        parts.append(f"10日涨跌 {change_10d:+.1f}%")
+    return "；短线条件：" + "，".join(parts) if parts else ""
+
+
+def _build_dsa_us_intraday_reason(intraday: Dict[str, Any]) -> str:
+    summary = intraday.get("summary") if isinstance(intraday, dict) else None
+    if not isinstance(summary, dict):
+        return "；最近24小时分时走势暂不可用"
+    windows = summary.get("window_changes") if isinstance(summary.get("window_changes"), dict) else {}
+    parts: List[str] = []
+    for key in ("1h", "4h", "12h", "24h"):
+        payload = windows.get(key) if isinstance(windows.get(key), dict) else {}
+        change = _safe_float(payload.get("change_pct"))
+        if change is not None:
+            parts.append(f"{key} {change:+.2f}%")
+    if not parts:
+        change = _safe_float(summary.get("change_pct"))
+        if change is not None:
+            parts.append(f"区间 {change:+.2f}%")
+    trend = _env_text(summary.get("trend_label"))
+    trend_text = {
+        "strong_up": "明显上行",
+        "up": "温和上行",
+        "flat": "横盘",
+        "range_bound": "震荡",
+        "down": "温和下行",
+        "strong_down": "明显下行",
+    }.get(trend, "")
+    if trend_text:
+        parts.append(trend_text)
+    return "；最近24小时走势：" + "，".join(parts) if parts else ""
+
+
+def _dsa_us_risk_level(
+    quote: Dict[str, Any],
+    *,
+    calibration: Optional[Dict[str, Any]] = None,
+    intraday: Optional[Dict[str, Any]] = None,
+    data_confidence: float = 0.0,
+) -> str:
+    change_pct = abs(_safe_float(quote.get("change_pct")) or 0.0)
+    calibration = calibration or {}
+    technical_score = _safe_float(calibration.get("technical_score"))
+    change_5d = _safe_float(calibration.get("change_5d_pct"))
+    intraday_scores = _score_dsa_us_recent_intraday(intraday or {}, strategy="dsa_us_short_swing_recovery")
+    change_4h = intraday_scores.get("intraday_4h_change", 0.0)
+    if (
+        quote.get("is_stale") is True
+        or change_pct >= 8
+        or float(data_confidence or 0.0) < 45.0
+        or (technical_score is not None and technical_score < 40.0)
+        or (change_5d is not None and change_5d < -12.0)
+        or change_4h <= -4.0
+    ):
+        return "high"
+    if (
+        change_pct >= 4
+        or float(data_confidence or 0.0) < 72.0
+        or _env_text(quote.get("market_session")) in DSA_US_EXTENDED_SESSIONS
+        or (technical_score is not None and technical_score < 52.0)
+        or intraday_scores.get("intraday_chase_penalty", 0.0) > 0
+    ):
+        return "medium"
+    return "low"
+
+
+def _dsa_us_risk_flags(
+    quote: Dict[str, Any],
+    *,
+    calibration: Optional[Dict[str, Any]] = None,
+    intraday: Optional[Dict[str, Any]] = None,
+    data_confidence: float = 0.0,
+) -> List[str]:
+    flags: List[str] = []
+    change_pct = _safe_float(quote.get("change_pct")) or 0.0
+    if abs(change_pct) >= 5:
+        flags.append("high_intraday_volatility")
+    if quote.get("is_stale"):
+        flags.append("stale_quote")
+    elif quote.get("is_stale") is None:
+        flags.append("quote_freshness_unknown")
+    session = _env_text(quote.get("market_session"))
+    if session in {"pre_market", "post_market", "overnight"}:
+        flags.append(f"extended_session_{session}")
+    calibration = calibration or {}
+    technical_score = _safe_float(calibration.get("technical_score"))
+    price_vs_ma20 = _safe_float(calibration.get("price_vs_ma20_pct"))
+    if technical_score is not None and technical_score < 50.0:
+        flags.append("weak_daily_trend")
+    if price_vs_ma20 is not None and price_vs_ma20 < 0:
+        flags.append("below_ma20")
+    if (_safe_float(calibration.get("valuation_penalty")) or 0.0) >= 8.0:
+        flags.append("high_valuation_penalty")
+    drawdown_60d = _safe_float(calibration.get("drawdown_60d_pct"))
+    change_5d = _safe_float(calibration.get("change_5d_pct"))
+    if drawdown_60d is not None and drawdown_60d < 1.5:
+        flags.append("near_60d_high")
+    if drawdown_60d is not None and drawdown_60d > 24.0:
+        flags.append("deep_pullback_risk")
+    if change_5d is not None and change_5d < -12.0:
+        flags.append("sharp_recent_drop")
+    if change_5d is not None and change_5d > 6.0:
+        flags.append("recent_price_chase_risk")
+    intraday_scores = _score_dsa_us_recent_intraday(intraday or {}, strategy="dsa_us_short_swing_recovery")
+    if not intraday_scores.get("recent_24h_available"):
+        flags.append("recent_24h_trend_missing")
+    elif intraday_scores.get("intraday_chase_penalty", 0.0) > 0:
+        flags.append("intraday_chase_risk")
+    if float(data_confidence or 0.0) < 72.0:
+        flags.append("low_data_confidence")
+    return flags
 
 
 def _ensure_supported_strategy(strategy: str) -> None:
@@ -3232,9 +5457,13 @@ def _normalize_daily_date_value(value: Any) -> str:
     return text
 
 
-def get_dsa_realtime_quote(stock_code: str) -> Dict[str, Any]:
+def get_dsa_realtime_quote(stock_code: str, *, supplement: bool = True) -> Dict[str, Any]:
     manager = _get_dsa_fetcher_manager()
-    quote = manager.get_realtime_quote(stock_code, log_final_failure=False)
+    quote = manager.get_realtime_quote(
+        stock_code,
+        log_final_failure=False,
+        supplement=supplement,
+    )
     if quote is None:
         return {}
     if hasattr(quote, "to_dict") and callable(quote.to_dict):
@@ -3324,7 +5553,7 @@ def _enrich_candidates_with_dsa(candidates: List[Dict[str, Any]]) -> Tuple[List[
             enriched = _build_dsa_candidate_context(
                 candidate,
                 include_news=True,
-                include_fundamentals=True,
+                include_fundamentals=_env_text(candidate.get("asset_type")) != "etf",
                 profile="post_rank_full",
             )
             candidate.update(enriched)
@@ -3593,6 +5822,9 @@ def _normalize_candidate(raw: Any, rank: int) -> Dict[str, Any]:
         "reason": item.get("reason") or source.get("reason") or source.get("ranking_reason") or source.get("risk_summary") or item.get("summary") or _build_candidate_reason(source),
         "risk_level": item.get("risk_level") or source.get("risk_level") or "",
         "risk_flags": item.get("risk_flags") or source.get("risk_flags") or [],
+        "data_confidence": _first_present(item, source, "data_confidence"),
+        "data_warnings": item.get("data_warnings") or source.get("data_warnings") or [],
+        "asset_type": item.get("asset_type") or source.get("asset_type") or "stock",
         "llm_score": _first_present(item, source, "llm_score"),
         "llm_confidence": _first_present(item, source, "llm_confidence"),
         "llm_sector": item.get("llm_sector") or source.get("llm_sector") or "",
@@ -3608,6 +5840,8 @@ def _normalize_candidate(raw: Any, rank: int) -> Dict[str, Any]:
         "change_pct": _first_present(item, source, "change_pct"),
         "amount": _first_present(item, source, "amount"),
         "industry": item.get("industry") or source.get("industry") or "",
+        "sector": item.get("sector") or source.get("sector") or "",
+        "country": item.get("country") or source.get("country") or "",
         "factor_scores": item.get("factor_scores") or source.get("factor_scores") or {},
         "dsa_context": dsa_context,
         "dsa_news": dsa_news,

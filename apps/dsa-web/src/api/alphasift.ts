@@ -33,6 +33,8 @@ export type AlphaSiftCandidate = {
   reason: string;
   riskLevel?: string;
   riskFlags?: string[];
+  dataConfidence?: number | null;
+  dataWarnings?: string[];
   llmScore?: number | null;
   llmConfidence?: number | null;
   llmSector?: string;
@@ -44,10 +46,15 @@ export type AlphaSiftCandidate = {
   llmWatchItems?: string[];
   llmInvalidators?: string[];
   llmStyleFit?: string;
+  llmStatus?: 'pending' | 'running' | 'completed' | 'failed' | string;
+  llmError?: string;
   price?: number | null;
   changePct?: number | null;
   amount?: number | null;
   industry?: string;
+  sector?: string;
+  country?: string;
+  assetType?: 'stock' | 'etf' | string;
   factorScores?: Record<string, number>;
   postAnalysisSummaries?: Record<string, string>;
   postAnalysisTags?: string[];
@@ -55,6 +62,13 @@ export type AlphaSiftCandidate = {
     enriched?: boolean;
     quote?: Record<string, unknown>;
     fundamentals?: Record<string, unknown>;
+    dailyCalibration?: Record<string, unknown>;
+    recentIntraday?: {
+      barCount?: number | null;
+      startTime?: string | null;
+      endTime?: string | null;
+      summary?: Record<string, unknown>;
+    };
     news?: {
       success?: boolean;
       query?: string;
@@ -191,7 +205,22 @@ export type AlphaSiftScreenResponse = {
   strategy?: string;
   market?: string;
   snapshotCount?: number;
+  prefilterCount?: number;
+  realtimePrefilterCount?: number;
+  deepScoreLimit?: number;
   afterFilterCount?: number;
+  universeSource?: string;
+  universeEligibleCount?: number | null;
+  universeLimit?: number | null;
+  universeBasketCounts?: Record<string, number>;
+  aiUsed?: boolean | null;
+  rankingMethod?: string;
+  aiScoreStatus?: 'pending' | 'processing' | 'completed' | 'failed' | string;
+  aiScoreTaskId?: string;
+  aiScoreTotalCount?: number;
+  aiScoreProcessedCount?: number;
+  aiScoreCompletedCount?: number;
+  aiScoreFailedCount?: number;
   llmRanked?: boolean;
   llmMarketView?: string;
   llmSelectionLogic?: string;
@@ -234,6 +263,52 @@ export type AlphaSiftScreenTaskStatus = {
   message?: string | null;
   error?: string | null;
   result?: AlphaSiftScreenResponse | null;
+};
+
+export type AlphaSiftAiScoreItem = {
+  rank?: number;
+  code: string;
+  name?: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | string;
+  llmScore?: number | null;
+  llmConfidence?: number | null;
+  llmSector?: string;
+  llmTheme?: string;
+  llmTags?: string[];
+  llmThesis?: string;
+  llmCatalysts?: string[];
+  llmRisks?: string[];
+  llmWatchItems?: string[];
+  llmStyleFit?: string;
+  error?: string;
+  model?: string;
+  scoredAt?: string;
+};
+
+export type AlphaSiftAiScoreResult = {
+  runId?: string;
+  strategy?: string;
+  market?: string;
+  status: 'processing' | 'completed' | string;
+  currentCode?: string;
+  totalCount: number;
+  processedCount: number;
+  completedCount: number;
+  failedCount: number;
+  items: AlphaSiftAiScoreItem[];
+};
+
+export type AlphaSiftAiScoreAccepted = {
+  taskId: string;
+  traceId?: string | null;
+  status: 'pending' | 'processing' | string;
+  message: string;
+  screenTaskId: string;
+  totalCount: number;
+};
+
+export type AlphaSiftAiScoreTaskStatus = Omit<AlphaSiftScreenTaskStatus, 'result'> & {
+  result?: AlphaSiftAiScoreResult | null;
 };
 
 export function notifyAlphaSiftConfigChanged(): void {
@@ -283,6 +358,18 @@ export const alphasiftApi = {
   async getScreenTask(taskId: string): Promise<AlphaSiftScreenTaskStatus> {
     const response = await apiClient.get<Record<string, unknown>>(`/api/v1/alphasift/screen/tasks/${encodeURIComponent(taskId)}`);
     return toCamelCase<AlphaSiftScreenTaskStatus>(response.data);
+  },
+
+  async startAiScore(screenTaskId: string): Promise<AlphaSiftAiScoreAccepted> {
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/alphasift/screen/llm/tasks', {
+      screen_task_id: screenTaskId,
+    });
+    return toCamelCase<AlphaSiftAiScoreAccepted>(response.data);
+  },
+
+  async getAiScoreTask(taskId: string): Promise<AlphaSiftAiScoreTaskStatus> {
+    const response = await apiClient.get<Record<string, unknown>>(`/api/v1/alphasift/screen/llm/tasks/${encodeURIComponent(taskId)}`);
+    return toCamelCase<AlphaSiftAiScoreTaskStatus>(response.data);
   },
 
   async getStrategies(): Promise<AlphaSiftStrategiesResponse> {

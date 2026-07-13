@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List
@@ -101,7 +101,7 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
                     "warnings": [],
                 },
             ),
-        ):
+        ), patch("src.services.alphasift_service._append_dsa_us_screen_history"):
             return alphasift_endpoint.alphasift_screen(
                 alphasift_endpoint.AlphaSiftScreenRequest(**kwargs),
                 http_request=self._request(),
@@ -285,10 +285,649 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
             payload = self._strategies(config=config)
 
         self.assertEqual(payload["enabled"], True)
-        self.assertEqual(payload["strategy_count"], 2)
+        self.assertEqual(payload["strategy_count"], 6)
         self.assertEqual(payload["strategies"][0]["id"], "dual_low")
         self.assertEqual(payload["strategies"][0]["name"], "双低选股")
         self.assertEqual(payload["strategies"][1]["name"], "趋势质量")
+        self.assertEqual(payload["strategies"][0]["market_scope"], ["cn"])
+        self.assertIn("dsa_us_realtime_momentum", {item["id"] for item in payload["strategies"]})
+        us_strategy = next(item for item in payload["strategies"] if item["id"] == "dsa_us_realtime_momentum")
+        self.assertEqual(us_strategy["market_scope"], ["us"])
+        short_swing = next(item for item in payload["strategies"] if item["id"] == "dsa_us_short_swing_recovery")
+        self.assertEqual(short_swing["market_scope"], ["us"])
+        self.assertEqual(short_swing["tag"], "短线")
+
+    def test_screen_us_uses_dsa_realtime_strategy_without_alphasift_market_support(self) -> None:
+        config = self._config(enabled=True)
+        config.stock_list = ["TSLA", "600519", "AAPL.US"]
+        fake_manager = SimpleNamespace(prefetch_realtime_quotes=MagicMock())
+        fake_module = _make_adapter_module(
+            get_status=lambda: {
+                "supported_markets": ["cn"],
+                "contract_version": "1",
+                "version": "0.2.0",
+                "strategy_count": 1,
+            },
+            screen=MagicMock(side_effect=AssertionError("DSA US screen must not call AlphaSift screen")),
+        )
+
+        def quote_for(code: str) -> Dict[str, Any]:
+            return {
+                "code": code,
+                "name": code,
+                "source": "longbridge",
+                "market": "us",
+                "market_session": "overnight",
+                "price": {"TSLA": 396.2, "AAPL": 214.1}.get(code, 100.0),
+                "change_pct": {"TSLA": 2.4, "AAPL": -0.3}.get(code, 0.4),
+                "amount": 10000000.0,
+                "provider_timestamp": "2026-07-09T02:30:00Z",
+            }
+
+        with (
+            patch("src.services.alphasift_service._import_alphasift", return_value=fake_module),
+            patch("src.services.alphasift_service._get_dsa_fetcher_manager", return_value=fake_manager),
+            patch(
+                "src.services.alphasift_service._build_dsa_us_dynamic_universe",
+                return_value=(
+                    [],
+                    {
+                        "snapshot_count": 7154,
+                        "snapshot_source": "nasdaq_screener",
+                        "universe_source": "nasdaq_screener",
+                        "eligible_count": 3200,
+                        "limit": 80,
+                        "source_errors": [],
+                        "warnings": [],
+                    },
+                ),
+            ),
+            patch("src.services.alphasift_service.get_dsa_realtime_quote", side_effect=quote_for),
+        ):
+            payload = self._screen(
+                config,
+                market="us",
+                strategy="dsa_us_realtime_momentum",
+                max_results=2,
+            )
+
+        fake_module.screen.assert_not_called()
+        fake_manager.prefetch_realtime_quotes.assert_called_once()
+        self.assertEqual(payload["market"], "us")
+        self.assertEqual(payload["strategy"], "dsa_us_realtime_momentum")
+        self.assertEqual(payload["snapshot_count"], 7154)
+        self.assertEqual(payload["snapshot_source"], "nasdaq_screener")
+        self.assertEqual(payload["prefilter_count"], 20)
+        self.assertTrue(any(item["asset_type"] == "etf" for item in payload["candidates"]))
+        self.assertEqual(payload["universe_source"], "configured_default_and_liquid_etfs")
+        self.assertFalse(payload["ai_used"])
+        self.assertEqual(payload["ranking_method"], "quantitative_rules")
+        self.assertEqual(payload["candidate_count"], 2)
+        self.assertEqual(payload["candidates"][0]["code"], "TSLA")
+        self.assertEqual(payload["candidates"][0]["raw"]["price_session"], "overnight")
+        self.assertEqual(payload["dsa_enrichment"]["requested_count"], 2)
+
+    def test_screen_us_demotes_realtime_leader_when_daily_calibration_is_weak(self) -> None:
+        config = self._config(enabled=True)
+        fake_manager = SimpleNamespace(prefetch_realtime_quotes=MagicMock())
+        fake_module = _make_adapter_module(
+            get_status=lambda: {
+                "supported_markets": ["cn"],
+                "contract_version": "1",
+                "version": "0.2.0",
+                "strategy_count": 1,
+            },
+            screen=MagicMock(side_effect=AssertionError("DSA US screen must not call AlphaSift screen")),
+        )
+
+        def quote_for(code: str) -> Dict[str, Any]:
+            quotes = {
+                "AVGO": {
+                    "code": "AVGO",
+                    "name": "Broadcom",
+                    "source": "longbridge",
+                    "market": "us",
+                    "market_session": "overnight",
+                    "price": 280.0,
+                    "change_pct": 3.2,
+                    "amount": 80000000.0,
+                    "provider_timestamp": "2026-07-09T02:30:00Z",
+                },
+                "TSLA": {
+                    "code": "TSLA",
+                    "name": "Tesla",
+                    "source": "longbridge",
+                    "market": "us",
+                    "market_session": "overnight",
+                    "price": 396.2,
+                    "change_pct": 1.1,
+                    "amount": 30000000.0,
+                    "provider_timestamp": "2026-07-09T02:30:00Z",
+                },
+            }
+            return quotes[code]
+
+        calibrations = {
+            "AVGO": {
+                "available": True,
+                "source": "LongbridgeFetcher",
+                "bar_count": 60,
+                "technical_score": 42.0,
+                "quality_gate": -22.0,
+                "score_cap": 54.0,
+                "valuation_penalty": 8.0,
+                "ma_alignment": "bearish",
+                "above_ma_count": 1,
+                "price_vs_ma5_pct": -1.2,
+                "price_vs_ma10_pct": -2.4,
+                "price_vs_ma20_pct": -3.6,
+                "change_20d_pct": -5.1,
+                "change_60d_pct": 2.2,
+                "drawdown_60d_pct": 12.8,
+                "warnings": [],
+            },
+            "TSLA": {
+                "available": True,
+                "source": "LongbridgeFetcher",
+                "bar_count": 60,
+                "technical_score": 70.0,
+                "quality_gate": 11.0,
+                "score_cap": None,
+                "valuation_penalty": 0.0,
+                "ma_alignment": "bullish",
+                "above_ma_count": 4,
+                "price_vs_ma5_pct": 1.0,
+                "price_vs_ma10_pct": 2.0,
+                "price_vs_ma20_pct": 3.0,
+                "change_20d_pct": 9.0,
+                "change_60d_pct": 16.0,
+                "drawdown_60d_pct": 2.0,
+                "warnings": [],
+            },
+        }
+
+        with (
+            patch("src.services.alphasift_service._import_alphasift", return_value=fake_module),
+            patch("src.services.alphasift_service._get_dsa_fetcher_manager", return_value=fake_manager),
+            patch("src.services.alphasift_service._build_dsa_us_universe", return_value=["AVGO", "TSLA"]),
+            patch("src.services.alphasift_service.get_dsa_realtime_quote", side_effect=quote_for),
+            patch(
+                "src.services.alphasift_service._build_dsa_us_analysis_calibration",
+                side_effect=lambda **kwargs: calibrations[kwargs["code"]],
+            ),
+        ):
+            payload = self._screen(
+                config,
+                market="us",
+                strategy="dsa_us_realtime_momentum",
+                max_results=2,
+            )
+
+        self.assertEqual([item["code"] for item in payload["candidates"]], ["TSLA", "AVGO"])
+        avgo = payload["candidates"][1]
+        self.assertLessEqual(avgo["score"], 54.0)
+        self.assertEqual(avgo["factor_scores"]["technical_score"], 42.0)
+        self.assertEqual(avgo["raw"]["daily_calibration"]["ma_alignment"], "bearish")
+        self.assertIn("weak_daily_trend", avgo["risk_flags"])
+        self.assertIn("弱势封顶", avgo["reason"])
+
+    def test_short_swing_dynamic_universe_includes_pullback_basket(self) -> None:
+        def row(symbol: str, *, volume: int, market_cap: int, pct_change: float) -> Dict[str, str]:
+            return {
+                "symbol": symbol,
+                "name": f"{symbol} Common Stock",
+                "lastsale": "$25.00",
+                "volume": str(volume),
+                "marketCap": str(market_cap),
+                "pctchange": f"{pct_change}%",
+            }
+
+        rows = [
+            row(f"BIG{i}", volume=15_000_000 - i * 100_000, market_cap=80_000_000_000, pct_change=5.2)
+            for i in range(12)
+        ]
+        rows.append(row("PULL", volume=450_000, market_cap=2_500_000_000, pct_change=-1.8))
+
+        with (
+            patch.dict(os.environ, {"DSA_US_UNIVERSE_PREFILTER_LIMIT": "10"}, clear=False),
+            patch("src.services.alphasift_service._fetch_dsa_us_nasdaq_screener_rows", return_value=rows),
+        ):
+            symbols, meta = alphasift_service._build_dsa_us_dynamic_universe(strategy="dsa_us_short_swing_recovery")
+
+        self.assertEqual(meta["snapshot_count"], len(rows))
+        self.assertIn("PULL", symbols)
+        self.assertGreater(meta["basket_counts"]["controlled_pullback"], 0)
+
+    def test_us_universe_prioritizes_dynamic_rows_and_includes_liquid_etfs(self) -> None:
+        config = self._config(enabled=True)
+        config.stock_list = ["TSLA", "SPY"]
+        dynamic_meta = {
+            "snapshot_count": 100,
+            "eligible_count": 30,
+            "symbol_meta": {
+                "DYN": {"name": "Dynamic Corp", "sector": "Healthcare", "industry": "Biotechnology"},
+            },
+        }
+        with patch(
+            "src.services.alphasift_service._build_dsa_us_dynamic_universe",
+            return_value=(["DYN"], dynamic_meta),
+        ):
+            universe, meta = alphasift_service._build_dsa_us_universe(
+                config,
+                strategy="dsa_us_short_swing_recovery",
+            )
+
+        self.assertEqual(universe[0], "DYN")
+        self.assertIn("SPY", universe)
+        self.assertIn("QQQ", universe)
+        self.assertEqual(meta["symbol_meta"]["SPY"]["asset_type"], "etf")
+        self.assertEqual(meta["etf_count"], len(alphasift_service.DSA_US_LIQUID_ETF_UNIVERSE))
+        self.assertEqual(meta["symbol_meta"]["DYN"]["industry"], "Biotechnology")
+
+    def test_us_factor_score_preserves_zero_volume_ratio_and_unknown_freshness(self) -> None:
+        scores = alphasift_service._score_dsa_us_factors(
+            strategy="dsa_us_short_swing_recovery",
+            quote={
+                "price": 100.0,
+                "change_pct": 0.4,
+                "volume_ratio": 0.0,
+                "is_stale": None,
+                "market_session": "overnight",
+            },
+            amount=30_000_000.0,
+            calibration=alphasift_service._neutral_dsa_us_analysis_calibration(),
+            data_confidence=60.0,
+        )
+
+        self.assertEqual(scores["volume_signal"], 0.0)
+        self.assertEqual(scores["freshness"], 2.0)
+
+    def test_short_swing_etf_does_not_require_company_valuation(self) -> None:
+        scores = alphasift_service._score_dsa_us_factors(
+            strategy="dsa_us_short_swing_recovery",
+            quote={
+                "asset_type": "etf",
+                "price": 100.0,
+                "change_pct": 0.4,
+                "is_stale": False,
+                "market_session": "overnight",
+            },
+            amount=50_000_000.0,
+            calibration=alphasift_service._neutral_dsa_us_analysis_calibration(),
+            data_confidence=80.0,
+        )
+
+        self.assertEqual(scores["fundamental_quality"], 0.0)
+        self.assertEqual(scores["strategy_score_cap"], 0.0)
+
+    def test_ai_scores_us_candidates_sequentially_and_publishes_partial_results(self) -> None:
+        config = self._config(enabled=True)
+        fake_analyzer = MagicMock()
+        fake_analyzer.generate_text.side_effect = [
+            json.dumps({
+                "score": 86,
+                "confidence": 0.82,
+                "thesis": "第一只短线结构较完整",
+                "risks": ["盘前流动性"],
+                "watch_items": ["观察开盘量能"],
+                "catalysts": [],
+                "style_fit": "适合",
+                "theme": "软件",
+                "tags": ["回踩"],
+            }, ensure_ascii=False),
+            json.dumps({
+                "score": 71,
+                "confidence": 0.68,
+                "thesis": "第二只仍需确认修复",
+                "risks": ["反弹确认不足"],
+                "watch_items": ["站稳VWAP"],
+                "catalysts": [],
+                "style_fit": "谨慎",
+                "theme": "医药",
+                "tags": ["观察"],
+            }, ensure_ascii=False),
+        ]
+        updates: List[Dict[str, Any]] = []
+        candidates = [
+            {"rank": 1, "code": "MSFT", "name": "微软", "score": 90, "reason": "量化第一", "raw": {}},
+            {"rank": 2, "code": "JNJ", "name": "强生", "score": 84, "reason": "量化第二", "raw": {}},
+        ]
+
+        with patch("src.analyzer.GeminiAnalyzer", return_value=fake_analyzer):
+            result = alphasift_service._score_dsa_screen_candidates_with_ai(
+                candidates=candidates,
+                strategy="dsa_us_short_swing_recovery",
+                market="us",
+                run_id="run-1",
+                config=config,
+                progress_callback=lambda payload, progress, message: updates.append({
+                    "payload": json.loads(json.dumps(payload, ensure_ascii=False)),
+                    "progress": progress,
+                    "message": message,
+                }),
+            )
+
+        self.assertEqual(fake_analyzer.generate_text.call_count, 2)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["completed_count"], 2)
+        self.assertEqual(result["items"][0]["llm_score"], 86.0)
+        self.assertEqual(result["items"][1]["llm_score"], 71.0)
+        self.assertEqual(updates[0]["payload"]["items"][0]["status"], "running")
+        self.assertEqual(updates[0]["payload"]["items"][1]["status"], "pending")
+        self.assertTrue(any(
+            update["payload"]["items"][0]["status"] == "completed"
+            and update["payload"]["items"][1]["status"] == "running"
+            for update in updates
+        ))
+
+    def test_ai_scoring_prefers_configured_low_latency_model(self) -> None:
+        config = self._config(enabled=True)
+        config.litellm_model = "openai/glm-5.2"
+        config.litellm_fallback_models = ["deepseek/deepseek-v4-pro"]
+        config.llm_model_list = [
+            {"model_name": "deepseek/deepseek-v4-flash", "litellm_params": {"model": "deepseek/deepseek-v4-flash"}},
+            {"model_name": "deepseek/deepseek-v4-pro", "litellm_params": {"model": "deepseek/deepseek-v4-pro"}},
+            {"model_name": "openai/glm-5.2", "litellm_params": {"model": "openai/glm-5.2"}},
+        ]
+
+        scoring_config = alphasift_service._dsa_ai_scoring_config(config)
+
+        self.assertEqual(scoring_config.litellm_model, "deepseek/deepseek-v4-flash")
+        self.assertEqual(
+            scoring_config.litellm_fallback_models,
+            ["openai/glm-5.2", "deepseek/deepseek-v4-pro"],
+        )
+        self.assertEqual(config.litellm_model, "openai/glm-5.2")
+
+    def test_short_swing_extended_session_cap_changes_continuously(self) -> None:
+        def score(change_pct: float) -> Dict[str, float]:
+            return alphasift_service._score_dsa_us_factors(
+                strategy="dsa_us_short_swing_recovery",
+                quote={
+                    "price": 100.0,
+                    "change_pct": change_pct,
+                    "is_stale": False,
+                    "market_session": "overnight",
+                    "pe_ratio": 30.0,
+                },
+                amount=50_000_000.0,
+                calibration=alphasift_service._neutral_dsa_us_analysis_calibration(),
+                data_confidence=80.0,
+            )
+
+        down = score(-0.1)
+        flat = score(0.0)
+        rising = score(0.1)
+
+        self.assertLess(down["extended_session_cap"], flat["extended_session_cap"])
+        self.assertLess(flat["extended_session_cap"], rising["extended_session_cap"])
+
+    def test_short_swing_skips_symbol_without_minimum_daily_bars(self) -> None:
+        manager = SimpleNamespace(
+            prefetch_realtime_quotes=MagicMock(),
+            get_recent_intraday_price_action=MagicMock(return_value=None),
+        )
+        quote = {
+            "code": "NEW",
+            "price": 20.0,
+            "change_pct": 1.0,
+            "amount": 30_000_000.0,
+            "market_session": "post_market",
+        }
+        with (
+            patch("src.services.alphasift_service._get_dsa_fetcher_manager", return_value=manager),
+            patch("src.services.alphasift_service.get_dsa_realtime_quote", return_value=quote),
+            patch(
+                "src.services.alphasift_service._build_dsa_us_analysis_calibration",
+                return_value=alphasift_service._neutral_dsa_us_analysis_calibration(
+                    reason="insufficient_daily_bars:18"
+                ),
+            ),
+        ):
+            candidates, errors = alphasift_service._build_dsa_us_candidates(
+                strategy="dsa_us_short_swing_recovery",
+                universe=["NEW"],
+                max_results=1,
+            )
+
+        self.assertEqual(candidates, [])
+        self.assertTrue(any("daily_calibration_insufficient" in error for error in errors))
+
+    def test_recent_24h_scoring_penalizes_chasing_and_caps_rank(self) -> None:
+        intraday = {
+            "summary": {
+                "last_price": 110.0,
+                "vwap": 104.0,
+                "rebound_from_low_pct": 10.0,
+                "drawdown_from_high_pct": -0.5,
+                "window_changes": {
+                    "1h": {"change_pct": 2.0},
+                    "4h": {"change_pct": 6.0},
+                    "12h": {"change_pct": 8.0},
+                    "24h": {"change_pct": 10.0},
+                },
+            }
+        }
+        scores = alphasift_service._score_dsa_us_recent_intraday(
+            intraday,
+            strategy="dsa_us_short_swing_recovery",
+        )
+
+        self.assertGreater(scores["intraday_chase_penalty"], 0)
+        self.assertEqual(scores["recent_24h_cap"], 66.0)
+
+    def test_fresh_intraday_bar_replaces_older_quote_price_and_freshness(self) -> None:
+        old_timestamp = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        intraday_timestamp = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        quote = {
+            "code": "TEST",
+            "source": "longbridge",
+            "market_session": "overnight",
+            "price": 100.0,
+            "pre_close": 100.0,
+            "change_pct": 0.0,
+            "amount": 10_000_000.0,
+            "pe_ratio": 25.0,
+            "provider_timestamp": old_timestamp,
+            "is_stale": True,
+        }
+        calibration = {
+            **alphasift_service._neutral_dsa_us_analysis_calibration(),
+            "available": True,
+            "bar_count": 60,
+            "technical_score": 60.0,
+        }
+        intraday = {
+            "bar_count": 120,
+            "end_time": intraday_timestamp,
+            "summary": {
+                "end_time": intraday_timestamp,
+                "last_price": 101.0,
+                "window_changes": {"1h": {"change_pct": 0.5}},
+            },
+        }
+
+        candidate = alphasift_service._build_dsa_us_candidate(
+            code="TEST",
+            quote=quote,
+            strategy="dsa_us_short_swing_recovery",
+            rank=1,
+            calibration=calibration,
+            intraday=intraday,
+        )
+
+        self.assertEqual(candidate["price"], 101.0)
+        self.assertEqual(candidate["change_pct"], 1.0)
+        self.assertFalse(candidate["raw"]["quote"]["is_stale"])
+        self.assertEqual(candidate["raw"]["quote"]["original_provider_timestamp"], old_timestamp)
+        self.assertIn("最新5分钟K线校验", candidate["reason"])
+        self.assertNotEqual(candidate["risk_level"], "high")
+
+    def test_us_result_selection_limits_industry_concentration(self) -> None:
+        candidates = [
+            {"rank": index, "code": f"S{index}", "score": 100 - index, "sector": "Technology", "industry": "Semiconductors"}
+            for index in range(1, 7)
+        ] + [
+            {"rank": 7, "code": "H1", "score": 90, "sector": "Healthcare", "industry": "Biotechnology"},
+            {"rank": 8, "code": "F1", "score": 89, "sector": "Financials", "industry": "Banks"},
+        ]
+
+        selected, notes = alphasift_service._select_dsa_us_diversified_candidates(candidates, limit=5)
+
+        self.assertLessEqual(sum(item["industry"] == "Semiconductors" for item in selected), 3)
+        self.assertTrue(any("行业分散" in note for note in notes))
+
+    def test_screen_us_short_swing_prefers_liquid_quality_pullback_with_extended_rebound(self) -> None:
+        config = self._config(enabled=True)
+        fake_manager = SimpleNamespace(prefetch_realtime_quotes=MagicMock())
+        fake_module = _make_adapter_module(
+            get_status=lambda: {
+                "supported_markets": ["cn"],
+                "contract_version": "1",
+                "version": "0.2.0",
+                "strategy_count": 1,
+            },
+            screen=MagicMock(side_effect=AssertionError("DSA US screen must not call AlphaSift screen")),
+        )
+
+        def quote_for(code: str) -> Dict[str, Any]:
+            quotes = {
+                "MSFT": {
+                    "code": "MSFT",
+                    "name": "Microsoft",
+                    "source": "longbridge",
+                    "market": "us",
+                    "market_session": "overnight",
+                    "price": 520.0,
+                    "change_pct": 0.9,
+                    "amount": 60000000.0,
+                    "pe_ratio": 35.0,
+                    "provider_timestamp": "2026-07-09T02:30:00Z",
+                },
+                "NVDA": {
+                    "code": "NVDA",
+                    "name": "NVIDIA",
+                    "source": "longbridge",
+                    "market": "us",
+                    "market_session": "overnight",
+                    "price": 205.0,
+                    "change_pct": 1.8,
+                    "amount": 120000000.0,
+                    "pe_ratio": 58.0,
+                    "provider_timestamp": "2026-07-09T02:30:00Z",
+                },
+                "TSLA": {
+                    "code": "TSLA",
+                    "name": "Tesla",
+                    "source": "longbridge",
+                    "market": "us",
+                    "market_session": "overnight",
+                    "price": 396.2,
+                    "change_pct": 1.2,
+                    "amount": 90000000.0,
+                    "pe_ratio": 310.0,
+                    "provider_timestamp": "2026-07-09T02:30:00Z",
+                },
+            }
+            return quotes[code]
+
+        calibrations = {
+            "MSFT": {
+                "available": True,
+                "source": "LongbridgeFetcher",
+                "bar_count": 60,
+                "technical_score": 68.0,
+                "quality_gate": 9.5,
+                "score_cap": None,
+                "valuation_penalty": 0.0,
+                "ma_alignment": "bullish",
+                "above_ma_count": 4,
+                "price_vs_ma5_pct": 0.5,
+                "price_vs_ma10_pct": 1.0,
+                "price_vs_ma20_pct": 2.0,
+                "change_5d_pct": -3.2,
+                "change_10d_pct": -5.4,
+                "change_20d_pct": 4.0,
+                "change_60d_pct": 12.0,
+                "drawdown_20d_pct": 4.6,
+                "drawdown_60d_pct": 7.5,
+                "warnings": [],
+            },
+            "NVDA": {
+                "available": True,
+                "source": "LongbridgeFetcher",
+                "bar_count": 60,
+                "technical_score": 74.0,
+                "quality_gate": 13.2,
+                "score_cap": None,
+                "valuation_penalty": 0.0,
+                "ma_alignment": "bullish",
+                "above_ma_count": 4,
+                "price_vs_ma5_pct": 5.0,
+                "price_vs_ma10_pct": 7.2,
+                "price_vs_ma20_pct": 11.5,
+                "change_5d_pct": 8.0,
+                "change_10d_pct": 13.0,
+                "change_20d_pct": 16.0,
+                "change_60d_pct": 25.0,
+                "drawdown_20d_pct": 0.8,
+                "drawdown_60d_pct": 1.0,
+                "warnings": [],
+            },
+            "TSLA": {
+                "available": True,
+                "source": "LongbridgeFetcher",
+                "bar_count": 60,
+                "technical_score": 36.0,
+                "quality_gate": -24.0,
+                "score_cap": 50.0,
+                "valuation_penalty": 16.0,
+                "ma_alignment": "mixed",
+                "above_ma_count": 1,
+                "price_vs_ma5_pct": -4.2,
+                "price_vs_ma10_pct": -6.5,
+                "price_vs_ma20_pct": -8.4,
+                "change_5d_pct": -13.5,
+                "change_10d_pct": -16.0,
+                "change_20d_pct": -18.0,
+                "change_60d_pct": -8.0,
+                "drawdown_20d_pct": 17.0,
+                "drawdown_60d_pct": 28.0,
+                "warnings": [],
+            },
+        }
+
+        with (
+            patch("src.services.alphasift_service._import_alphasift", return_value=fake_module),
+            patch("src.services.alphasift_service._get_dsa_fetcher_manager", return_value=fake_manager),
+            patch("src.services.alphasift_service._build_dsa_us_universe", return_value=["MSFT", "NVDA", "TSLA"]),
+            patch("src.services.alphasift_service.get_dsa_realtime_quote", side_effect=quote_for),
+            patch(
+                "src.services.alphasift_service._build_dsa_us_analysis_calibration",
+                side_effect=lambda **kwargs: calibrations[kwargs["code"]],
+            ),
+        ):
+            payload = self._screen(
+                config,
+                market="us",
+                strategy="dsa_us_short_swing_recovery",
+                max_results=3,
+            )
+
+        self.assertEqual(payload["strategy"], "dsa_us_short_swing_recovery")
+        self.assertEqual(payload["candidates"][0]["code"], "MSFT")
+        msft_scores = payload["candidates"][0]["factor_scores"]
+        self.assertGreater(msft_scores["pullback_setup"], 0)
+        self.assertGreater(msft_scores["recent_dip_score"], 0)
+        self.assertGreater(msft_scores["extended_session_rebound"], 0)
+        self.assertGreater(msft_scores["fundamental_quality"], 0)
+        self.assertIn("短线条件", payload["candidates"][0]["reason"])
+        nvda = next(item for item in payload["candidates"] if item["code"] == "NVDA")
+        self.assertIn("near_60d_high", nvda["risk_flags"])
+        self.assertLess(nvda["score"], payload["candidates"][0]["score"])
+        tsla = next(item for item in payload["candidates"] if item["code"] == "TSLA")
+        self.assertIn("sharp_recent_drop", tsla["risk_flags"])
+        self.assertLessEqual(tsla["score"], 50.0)
 
     def test_hotspots_returns_alphasift_hotspot_summaries(self) -> None:
         config = self._config(enabled=True)
@@ -1686,6 +2325,98 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload.status, "completed")
         self.assertEqual(payload.result["candidate_count"], 0)
+
+    def test_start_ai_score_task_uses_completed_screen_result(self) -> None:
+        config = self._config(enabled=True)
+        screen_task = TaskInfo(
+            task_id="screen-task-1",
+            trace_id="screen-task-1",
+            stock_code="alphasift_screen",
+            status=QueueTaskStatus.COMPLETED,
+            progress=100,
+            result={
+                "run_id": "run-1",
+                "strategy": "dsa_us_short_swing_recovery",
+                "market": "us",
+                "candidates": [{"rank": 1, "code": "MSFT", "name": "微软", "raw": {}}],
+            },
+            report_type="alphasift_screen",
+        )
+        fake_queue = MagicMock()
+        fake_queue.get_task.return_value = screen_task
+        fake_queue.submit_background_task.return_value = SimpleNamespace(
+            task_id="ai-task-1",
+            trace_id="screen-task-1",
+            status=QueueTaskStatus.PENDING,
+            message="AI 将逐只评分 1 只候选股票",
+        )
+        ai_result = {
+            "run_id": "run-1",
+            "status": "completed",
+            "total_count": 1,
+            "processed_count": 1,
+            "completed_count": 1,
+            "failed_count": 0,
+            "items": [{"code": "MSFT", "status": "completed", "llm_score": 88}],
+        }
+
+        with (
+            patch("api.v1.endpoints.alphasift.get_task_queue", return_value=fake_queue),
+            patch("api.v1.endpoints.alphasift.uuid.uuid4", return_value=SimpleNamespace(hex="ai-task-1")),
+            patch.object(
+                alphasift_endpoint.AlphaSiftService,
+                "score_candidates_with_ai",
+                return_value=ai_result,
+            ) as score_mock,
+        ):
+            payload = alphasift_endpoint.alphasift_start_ai_score_task(
+                alphasift_endpoint.AlphaSiftAiScoreRequest(screen_task_id="screen-task-1"),
+                config=config,
+            )
+            run_task = fake_queue.submit_background_task.call_args.args[0]
+            result = run_task()
+
+        self.assertEqual(payload.task_id, "ai-task-1")
+        self.assertEqual(payload.total_count, 1)
+        self.assertEqual(fake_queue.submit_background_task.call_args.kwargs["report_type"], "alphasift_ai_score")
+        self.assertEqual(result["items"][0]["llm_score"], 88)
+        progress_callback = score_mock.call_args.kwargs["progress_callback"]
+        progress_callback(ai_result, 90, "AI评分进度 1/1")
+        fake_queue.update_task_partial_result.assert_called_once_with(
+            "ai-task-1",
+            ai_result,
+            progress=90,
+            message="AI评分进度 1/1",
+        )
+
+    def test_ai_score_task_status_returns_partial_result_while_processing(self) -> None:
+        task = TaskInfo(
+            task_id="ai-task-1",
+            trace_id="screen-task-1",
+            stock_code="alphasift_ai_score:screen-task-1",
+            status=QueueTaskStatus.PROCESSING,
+            progress=55,
+            message="正在为 JNJ 进行 AI 评分",
+            result={
+                "status": "processing",
+                "total_count": 2,
+                "processed_count": 1,
+                "items": [
+                    {"code": "MSFT", "status": "completed", "llm_score": 86},
+                    {"code": "JNJ", "status": "running"},
+                ],
+            },
+            report_type="alphasift_ai_score",
+        )
+        fake_queue = MagicMock()
+        fake_queue.get_task.return_value = task
+
+        with patch("api.v1.endpoints.alphasift.get_task_queue", return_value=fake_queue):
+            payload = alphasift_endpoint.alphasift_ai_score_task_status("ai-task-1")
+
+        self.assertEqual(payload.status, "processing")
+        self.assertEqual(payload.result["processed_count"], 1)
+        self.assertEqual(payload.result["items"][0]["llm_score"], 86)
 
     def test_screen_task_status_rejects_non_alphasift_task(self) -> None:
         task = TaskInfo(

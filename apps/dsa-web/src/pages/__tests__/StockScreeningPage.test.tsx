@@ -5,6 +5,7 @@ import StockScreeningPage from '../StockScreeningPage';
 const {
   enableAlphaSift,
   getAlphaSiftStatus,
+  getAiScoreTask,
   getHotspotDetail,
   getHotspots,
   getStrategies,
@@ -12,6 +13,7 @@ const {
   navigate,
   resetLastScreenResult,
   screenStocks,
+  startAiScore,
   startScreenTask,
 } = vi.hoisted(() => {
   let lastScreenResult: unknown = null;
@@ -39,9 +41,12 @@ const {
       result: lastScreenResult,
     };
   });
+  const startAiScore = vi.fn();
+  const getAiScoreTask = vi.fn();
   return {
     enableAlphaSift: vi.fn(),
     getAlphaSiftStatus: vi.fn(),
+    getAiScoreTask,
     getHotspotDetail: vi.fn(),
     getHotspots: vi.fn(),
     getStrategies: vi.fn(),
@@ -51,6 +56,7 @@ const {
       lastScreenResult = null;
     },
     screenStocks,
+    startAiScore,
     startScreenTask,
   };
 });
@@ -71,7 +77,9 @@ vi.mock('../../api/alphasift', () => ({
     getHotspots: (payload: unknown) => getHotspots(payload),
     getStrategies: () => getStrategies(),
     getScreenTask: (taskId: string) => getScreenTask(taskId),
+    getAiScoreTask: (taskId: string) => getAiScoreTask(taskId),
     screen: (payload: unknown) => screenStocks(payload),
+    startAiScore: (screenTaskId: string) => startAiScore(screenTaskId),
     startScreen: (payload: unknown) => startScreenTask(payload),
   },
 }));
@@ -89,8 +97,18 @@ const mockStrategiesResponse = {
       tags: ['value'],
       marketScope: ['cn'],
     },
+    {
+      id: 'dsa_us_realtime_momentum',
+      name: '美股实时动量',
+      title: '美股实时动量',
+      description: 'US realtime momentum',
+      category: '美股',
+      tag: '动量',
+      tags: ['us'],
+      marketScope: ['us'],
+    },
   ],
-  strategyCount: 1,
+  strategyCount: 2,
 };
 
 function createDeferred<T>() {
@@ -107,6 +125,7 @@ describe('StockScreeningPage', () => {
   beforeEach(() => {
     enableAlphaSift.mockReset();
     getAlphaSiftStatus.mockReset();
+    getAiScoreTask.mockReset();
     getHotspotDetail.mockReset();
     getHotspots.mockReset();
     getStrategies.mockReset();
@@ -114,6 +133,7 @@ describe('StockScreeningPage', () => {
     navigate.mockReset();
     resetLastScreenResult();
     screenStocks.mockReset();
+    startAiScore.mockReset();
     startScreenTask.mockClear();
     getStrategies.mockResolvedValue(mockStrategiesResponse);
     getHotspotDetail.mockResolvedValue({
@@ -753,7 +773,7 @@ describe('StockScreeningPage', () => {
     expect(await screen.findByText('选股已开启')).toBeInTheDocument();
 
     const marketSelect = screen.getByLabelText('市场') as HTMLSelectElement;
-    expect(Array.from(marketSelect.options).map((option) => option.value)).toEqual(['cn']);
+    expect(Array.from(marketSelect.options).map((option) => option.value)).toEqual(['cn', 'us']);
 
     [
       ['平衡选股', 'balanced_alpha'],
@@ -770,6 +790,60 @@ describe('StockScreeningPage', () => {
     expect(screenStocks).toHaveBeenCalledWith({
       market: 'cn',
       strategy: 'shrink_pullback',
+      maxResults: 3,
+    });
+  });
+
+  it('switches to US strategies and submits a US screening request', async () => {
+    getStrategies.mockResolvedValueOnce({
+      enabled: true,
+      strategies: [
+        { id: 'dual_low', name: '双低', description: 'desc', category: '价值', marketScope: ['cn'] },
+        {
+          id: 'dsa_us_realtime_momentum',
+          name: '美股实时动量',
+          description: 'desc',
+          category: '美股',
+          marketScope: ['us'],
+        },
+        {
+          id: 'dsa_us_balanced_realtime',
+          name: '美股实时均衡',
+          description: 'desc',
+          category: '美股',
+          marketScope: ['us'],
+        },
+      ],
+      strategyCount: 3,
+    });
+    getAlphaSiftStatus.mockResolvedValueOnce({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    screenStocks.mockResolvedValue({
+      enabled: true,
+      candidates: [],
+      candidateCount: 0,
+    });
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('市场'), {
+      target: { value: 'us' },
+    });
+
+    expect(screen.getByDisplayValue('dsa_us_realtime_momentum')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /美股实时动量/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /美股实时均衡/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /双低/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+    await waitFor(() => expect(screenStocks).toHaveBeenCalledTimes(1));
+    expect(screenStocks).toHaveBeenCalledWith({
+      market: 'us',
+      strategy: 'dsa_us_realtime_momentum',
       maxResults: 3,
     });
   });
@@ -885,6 +959,44 @@ describe('StockScreeningPage', () => {
     expect(window.sessionStorage.getItem('dsa.alphasift.activeScreenTask.v1')).toBeNull();
   });
 
+  it('restores the latest completed screening result after remounting the page', async () => {
+    getAlphaSiftStatus.mockResolvedValue({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    screenStocks.mockResolvedValueOnce({
+      enabled: true,
+      candidates: [
+        {
+          rank: 1,
+          code: '000001',
+          name: '保留的候选',
+          score: 86.5,
+          reason: 'completed result',
+          raw: {},
+        },
+      ],
+      candidateCount: 1,
+      strategy: 'dual_low',
+      market: 'cn',
+    });
+
+    const firstRender = render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+    expect(await screen.findByText('保留的候选')).toBeInTheDocument();
+    expect(window.sessionStorage.getItem('dsa.alphasift.latestScreenResult.v1')).toContain('保留的候选');
+
+    firstRender.unmount();
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('保留的候选')).toBeInTheDocument();
+    expect(screen.getByText('选股完成')).toBeInTheDocument();
+    expect(screenStocks).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps a restored screening task recoverable when status polling times out', async () => {
     getAlphaSiftStatus.mockResolvedValue({
       enabled: true,
@@ -936,7 +1048,10 @@ describe('StockScreeningPage', () => {
       ],
       candidateCount: 1,
       snapshotCount: 5193,
+      universeEligibleCount: 2300,
+      prefilterCount: 120,
       afterFilterCount: 20,
+      universeSource: 'nasdaq_screener',
       llmRanked: false,
       warnings: ['LLM ranking failed, falling back to screen_score: Missing gemini_api_key'],
     });
@@ -949,10 +1064,222 @@ describe('StockScreeningPage', () => {
     expect(await screen.findByText('LLM 已降级')).toBeInTheDocument();
     expect(screen.getByText(/缺少可用 LLM API Key/)).toBeInTheDocument();
     expect(screen.queryByText(/Missing gemini_api_key/)).not.toBeInTheDocument();
+    expect(screen.getByText('快照 5,193 只，可选 2,300 只，预筛 120 只，深度评分 20 只，返回 1 只')).toBeInTheDocument();
+    expect(screen.getByText('股票池来源：nasdaq_screener')).toBeInTheDocument();
     expect(screen.getByText('未重排')).toBeInTheDocument();
     expect(screen.getByText('本次 LLM 重排失败或未返回判断，当前展示的是本地因子评分结果。')).toBeInTheDocument();
     expect(screen.getByText('LLM 元数据未返回')).toBeInTheDocument();
     expect(screen.getAllByText('未返回（LLM 已降级）')).toHaveLength(2);
+  });
+
+  it('shows US screening stages, localized risk, confidence, and recent 24h trend', async () => {
+    getAlphaSiftStatus.mockResolvedValueOnce({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    screenStocks.mockResolvedValueOnce({
+      enabled: true,
+      candidates: [
+        {
+          rank: 1,
+          code: 'SPY',
+          name: 'SPDR S&P 500 ETF',
+          score: 82.5,
+          reason: '短线回踩修复候选',
+          riskLevel: 'medium',
+          riskFlags: ['extended_session_overnight', 'recent_price_chase_risk'],
+          dataConfidence: 78,
+          dataWarnings: ['volume_ratio_missing'],
+          sector: '宽基ETF',
+          industry: '标普500',
+          assetType: 'etf',
+          factorScores: {
+            technicalScore: 68,
+            recent24hAdjustment: 4.2,
+          },
+          dsaContext: {
+            quote: {
+              marketSession: 'overnight',
+              providerTimestamp: '2026-07-10T03:30:00Z',
+              preClose: 500,
+            },
+            recentIntraday: {
+              barCount: 120,
+              summary: {
+                windowChanges: {
+                  '1h': { changePct: 0.3 },
+                  '4h': { changePct: 0.8 },
+                  '12h': { changePct: -0.2 },
+                  '24h': { changePct: 1.1 },
+                },
+              },
+            },
+            warnings: [],
+          },
+          raw: {},
+        },
+      ],
+      candidateCount: 1,
+      strategy: 'dsa_us_short_swing_recovery',
+      aiUsed: false,
+      rankingMethod: 'quantitative_rules',
+      snapshotCount: 7140,
+      universeEligibleCount: 2295,
+      prefilterCount: 220,
+      realtimePrefilterCount: 40,
+      deepScoreLimit: 32,
+      afterFilterCount: 31,
+      portfolioDiversityEnabled: true,
+      portfolioConcentrationNotes: ['行业分散规则暂缓了 2 个过度集中的高排名候选。'],
+    });
+    startAiScore.mockResolvedValueOnce({
+      taskId: 'ai-task-1',
+      traceId: 'screen-task-1',
+      status: 'pending',
+      message: 'AI 将逐只评分 1 只候选股票',
+      screenTaskId: 'screen-task-1',
+      totalCount: 1,
+    });
+    getAiScoreTask.mockResolvedValueOnce({
+      taskId: 'ai-task-1',
+      status: 'completed',
+      progress: 100,
+      message: '任务执行完成',
+      result: {
+        runId: 'run-1',
+        strategy: 'dsa_us_short_swing_recovery',
+        market: 'us',
+        status: 'completed',
+        currentCode: '',
+        totalCount: 1,
+        processedCount: 1,
+        completedCount: 1,
+        failedCount: 0,
+        items: [{
+          rank: 1,
+          code: 'SPY',
+          name: 'SPDR S&P 500 ETF',
+          status: 'completed',
+          llmScore: 88,
+          llmConfidence: 0.82,
+          llmThesis: '流动性充足，回踩位置与24小时走势适合短线观察。',
+          llmRisks: ['夜盘流动性'],
+          llmWatchItems: ['观察开盘量能'],
+          llmCatalysts: ['指数风险偏好回升'],
+          llmStyleFit: '适合',
+        }],
+      },
+    });
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+
+    expect(await screen.findByText('快照 7,140 只，可选 2,295 只，候选池 220 只，实时层 40 只，深度评分 31 / 32 只，返回 1 只')).toBeInTheDocument();
+    expect(screen.getByText('策略匹配分')).toBeInTheDocument();
+    expect(await screen.findByText('排序：量化规则（AI 不改排名） · AI 评分完成 1/1')).toBeInTheDocument();
+    expect(screen.getByText('AI 评分')).toBeInTheDocument();
+    expect(screen.getByText('88.00')).toBeInTheDocument();
+    expect(screen.getByText('ETF · 标普500')).toBeInTheDocument();
+    expect(screen.getByText('流动性充足，回踩位置与24小时走势适合短线观察。')).toBeInTheDocument();
+    expect(startAiScore).toHaveBeenCalledWith('screen-task-1');
+    expect(screen.getByText('中等')).toBeInTheDocument();
+    expect(screen.getAllByText('78%').length).toBeGreaterThan(0);
+    expect(screen.getByText(/夜盘 · 行情时间 2026-07-10T03:30:00Z · 昨收 500.00/)).toBeInTheDocument();
+    expect(screen.getByText('1h +0.30% · 4h +0.80% · 12h -0.20% · 24h +1.10%')).toBeInTheDocument();
+    expect(screen.getByText('日线技术分')).toBeInTheDocument();
+    expect(screen.getByText(/夜盘流动性风险，近5日涨幅偏高/)).toBeInTheDocument();
+    expect(screen.getByText(/量比缺失/)).toBeInTheDocument();
+  });
+
+  it('renders AI scores one candidate at a time and resumes after remounting', async () => {
+    getAlphaSiftStatus.mockResolvedValue({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    screenStocks.mockResolvedValueOnce({
+      enabled: true,
+      runId: 'run-progressive',
+      strategy: 'dsa_us_realtime_momentum',
+      market: 'us',
+      candidates: [
+        { rank: 1, code: 'MSFT', name: '微软', score: 90, reason: '量化第一', raw: {} },
+        { rank: 2, code: 'JNJ', name: '强生', score: 84, reason: '量化第二', raw: {} },
+      ],
+      candidateCount: 2,
+      aiUsed: false,
+      rankingMethod: 'quantitative_rules',
+    });
+    startAiScore.mockResolvedValueOnce({
+      taskId: 'ai-task-progressive',
+      traceId: 'screen-task-1',
+      status: 'pending',
+      message: 'AI 将逐只评分 2 只候选股票',
+      screenTaskId: 'screen-task-1',
+      totalCount: 2,
+    });
+    getAiScoreTask
+      .mockResolvedValueOnce({
+        taskId: 'ai-task-progressive',
+        status: 'processing',
+        progress: 55,
+        message: '正在为 JNJ 进行 AI 评分（2/2）',
+        result: {
+          runId: 'run-progressive',
+          status: 'processing',
+          currentCode: 'JNJ',
+          totalCount: 2,
+          processedCount: 1,
+          completedCount: 1,
+          failedCount: 0,
+          items: [
+            { code: 'MSFT', status: 'completed', llmScore: 86, llmConfidence: 0.8, llmThesis: '第一只已完成' },
+            { code: 'JNJ', status: 'running' },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        taskId: 'ai-task-progressive',
+        status: 'completed',
+        progress: 100,
+        message: '任务执行完成',
+        result: {
+          runId: 'run-progressive',
+          status: 'completed',
+          currentCode: '',
+          totalCount: 2,
+          processedCount: 2,
+          completedCount: 2,
+          failedCount: 0,
+          items: [
+            { code: 'MSFT', status: 'completed', llmScore: 86, llmConfidence: 0.8, llmThesis: '第一只已完成' },
+            { code: 'JNJ', status: 'completed', llmScore: 72, llmConfidence: 0.7, llmThesis: '第二只已完成' },
+          ],
+        },
+      });
+
+    const firstRender = render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('市场'), { target: { value: 'us' } });
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+
+    expect(await screen.findByText('86.00')).toBeInTheDocument();
+    expect(screen.getByText('正在 AI 跑分')).toBeInTheDocument();
+    expect(screen.getByText('排序：量化规则（AI 不改排名） · AI 逐只评分中 1/2')).toBeInTheDocument();
+    expect(window.sessionStorage.getItem('dsa.alphasift.activeAiScoreTask.v1')).toContain('ai-task-progressive');
+
+    firstRender.unmount();
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('72.00')).toBeInTheDocument();
+    expect(screen.getByText('排序：量化规则（AI 不改排名） · AI 评分完成 2/2')).toBeInTheDocument();
+    expect(screenStocks).toHaveBeenCalledTimes(1);
+    expect(startAiScore).toHaveBeenCalledTimes(1);
+    expect(window.sessionStorage.getItem('dsa.alphasift.activeAiScoreTask.v1')).toBeNull();
   });
 
   it('deduplicates AlphaSift snapshot fallback warnings and source errors', async () => {

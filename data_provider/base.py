@@ -1530,6 +1530,33 @@ class DataFetcherManager:
         if not config.enable_realtime_quote:
             logger.debug("[预取] component=realtime_prefetch action=skip reason=realtime_quote_disabled")
             return 0
+
+        longbridge = self._get_fetcher_by_name("LongbridgeFetcher", capability="realtime_quote")
+        if longbridge is not None and hasattr(longbridge, "prefetch_realtime_quotes"):
+            longbridge_codes = [
+                code
+                for code in stock_codes
+                if _is_hk_market(code) or _is_us_market(code)
+            ]
+            if longbridge_codes:
+                try:
+                    count = int(
+                        self._call_fetcher_method(
+                            longbridge,
+                            "prefetch_realtime_quotes",
+                            longbridge_codes,
+                        )
+                        or 0
+                    )
+                    if count:
+                        logger.info(
+                            "[预取] component=realtime_prefetch action=complete "
+                            "stock_count=%d prefetch_source=longbridge",
+                            count,
+                        )
+                        return count
+                except Exception as exc:
+                    logger.warning("[LongbridgeFetcher] realtime prefetch failed: %s", exc)
         
         # 检查优先级中是否包含适合批量预取的数据源
         # efinance/akshare_em/tushare 通过一次调用填充全市场缓存；
@@ -1718,7 +1745,13 @@ class DataFetcherManager:
         setattr(quote, "is_stale", stale_seconds > int(ttl))
         return quote
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        supplement: bool = True,
+    ):
         """
         获取实时行情数据（自动故障切换）
         
@@ -1794,16 +1827,22 @@ class DataFetcherManager:
                 primary_kw = {"source": "hk"} if primary_src == "AkshareFetcher" else {}
                 secondary_kw = {"source": "hk"} if secondary_src == "AkshareFetcher" else {}
 
+            if not supplement and primary_src == "LongbridgeFetcher":
+                primary_kw["include_volume_ratio"] = False
+            if not supplement and secondary_src == "LongbridgeFetcher":
+                secondary_kw["include_volume_ratio"] = False
+
             primary_token = self._realtime_fetcher_token(primary_src, **primary_kw)
             primary_quote = self._try_fetcher_quote(stock_code, primary_src, **primary_kw)
             fallback_from = primary_token if primary_quote is None else None
             if primary_quote is not None:
                 logger.info(f"[实时行情] {market_label} {stock_code} 成功获取 (来源: {primary_src})")
-            primary_quote = self._supplement_quote(
-                stock_code, primary_quote, secondary_src, **secondary_kw,
-            )
+            if primary_quote is None or supplement:
+                primary_quote = self._supplement_quote(
+                    stock_code, primary_quote, secondary_src, **secondary_kw,
+                )
             # 美股个股（非指数）尝试从 Finnhub/AlphaVantage 补充缺失字段
-            if is_us and not is_us_index and primary_quote is not None:
+            if supplement and is_us and not is_us_index and primary_quote is not None:
                 for extra_src in ["FinnhubFetcher", "AlphaVantageFetcher"]:
                     primary_quote = self._supplement_quote(
                         stock_code, primary_quote, extra_src,
@@ -1988,6 +2027,74 @@ class DataFetcherManager:
                 logger.info(f"[实时行情] {stock_code} 无可用数据源")
 
         return None
+
+    def get_recent_intraday_price_action(
+        self,
+        stock_code: str,
+        *,
+        hours: int = 24,
+        interval_minutes: int = 5,
+    ) -> Optional[Dict[str, Any]]:
+        """Return compact recent intraday price action for US/HK symbols.
+
+        This is intentionally Longbridge-only for now because it can request
+        extended sessions (pre/post/overnight) through a single quote context.
+        Failure is non-fatal and simply returns None so the analysis pipeline can
+        continue with daily bars and realtime quote data.
+        """
+        raw_stock_code = (stock_code or "").strip()
+        normalized_code = normalize_stock_code(stock_code)
+        fetcher = self._get_fetcher_by_name(
+            "LongbridgeFetcher",
+            capability="recent_intraday_price_action",
+        )
+        if fetcher is None or not hasattr(fetcher, "get_recent_intraday_price_action"):
+            logger.debug("[24小时走势] %s LongbridgeFetcher 不可用，跳过", normalized_code)
+            return None
+
+        attempt_start = time.time()
+        try:
+            record_provider_run_started(
+                data_type="recent_intraday_price_action",
+                provider=fetcher.name,
+                operation="get_recent_intraday_price_action",
+            )
+            payload = self._call_fetcher_method(
+                fetcher,
+                "get_recent_intraday_price_action",
+                raw_stock_code or normalized_code,
+                hours=hours,
+                interval_minutes=interval_minutes,
+            )
+            success = bool(
+                isinstance(payload, dict)
+                and payload.get("bar_count")
+                and payload.get("summary")
+            )
+            record_provider_run(
+                data_type="recent_intraday_price_action",
+                provider=fetcher.name,
+                operation="get_recent_intraday_price_action",
+                success=success,
+                latency_ms=int((time.time() - attempt_start) * 1000),
+                record_count=int(payload.get("bar_count") or 0) if isinstance(payload, dict) else 0,
+                error_type=None if success else "empty",
+                error_message=None if success else "empty or incomplete intraday bars",
+            )
+            return payload if success else None
+        except Exception as exc:
+            error_type, error_reason = summarize_exception(exc)
+            record_provider_run(
+                data_type="recent_intraday_price_action",
+                provider=getattr(fetcher, "name", "LongbridgeFetcher"),
+                operation="get_recent_intraday_price_action",
+                success=False,
+                latency_ms=int((time.time() - attempt_start) * 1000),
+                error_type=error_type,
+                error_message=error_reason,
+            )
+            logger.info("[24小时走势] %s 获取失败: %s", normalized_code, exc)
+            return None
 
     # Fields worth supplementing from secondary sources when the primary
     # source returns None for them. Ordered by importance.

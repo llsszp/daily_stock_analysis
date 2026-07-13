@@ -457,6 +457,8 @@ def get_stock_quote(stock_code: str) -> StockQuote:
             prev_close=result.get("prev_close"),
             volume=result.get("volume"),
             amount=result.get("amount"),
+            provider_timestamp=result.get("provider_timestamp"),
+            market_session=result.get("market_session"),
             update_time=result.get("update_time")
         )
         
