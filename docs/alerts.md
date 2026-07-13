@@ -394,15 +394,15 @@ scope/type 校验是双向约束：`target_scope=market` 只能使用两类 Mark
 
 ## P8 用户配置与部署边界
 
-P8 不新增规则类型、API、表结构或 worker 行为；它把 P0-P7 已合并能力整理成面向用户和部署者的配置说明。告警 worker 只在 schedule 模式注册，核心开关仍是 `AGENT_EVENT_MONITOR_ENABLED`，轮询间隔仍是 `AGENT_EVENT_MONITOR_INTERVAL_MINUTES`。通知渠道继续走 alert 路由，详见 [通知配置](notifications.md) 中的 `NOTIFICATION_ALERT_CHANNELS` 与 `route_type=alert`。
+告警 worker 可在 Web/API 长驻进程或 schedule 模式注册，核心开关是 `AGENT_EVENT_MONITOR_ENABLED`，轮询间隔由 `AGENT_EVENT_MONITOR_INTERVAL_MINUTES` 控制。通知渠道继续走 alert 路由，详见 [通知配置](notifications.md) 中的 `NOTIFICATION_ALERT_CHANNELS` 与 `route_type=alert`。
 
 ### 本地配置
 
-本地运行 `python main.py --schedule`、`python main.py --serve --schedule` 或等价内置调度模式时，设置 `AGENT_EVENT_MONITOR_ENABLED=true` 后会启动后台告警 worker；`AGENT_EVENT_MONITOR_INTERVAL_MINUTES` 控制轮询间隔。
+本地运行 Web/API 长驻进程、`python main.py --schedule`、`python main.py --serve --schedule` 或等价内置调度模式时，设置 `AGENT_EVENT_MONITOR_ENABLED=true` 后会启动后台告警 worker；它不依赖 `SCHEDULE_ENABLED`，`AGENT_EVENT_MONITOR_INTERVAL_MINUTES` 控制轮询间隔。
 
 规则来源有两类：
 
-- Alert API / Web 告警中心持久化规则：推荐入口，支持 `single_symbol`、`watchlist`、`portfolio_holdings`、`portfolio_account`、`market`，覆盖实时价、涨跌幅、成交量、日线技术指标、持仓风险与大盘红绿灯规则。
+- Alert API / Web 告警中心持久化规则：推荐入口，支持 `single_symbol`、`watchlist`、`portfolio_holdings`、`portfolio_account`、`market`，覆盖实时价、跟踪止损、涨跌幅、成交量、日线技术指标、持仓风险与大盘红绿灯规则。`trailing_stop` 达到启用价后持久化最高价，并按金额或比例回撤触发。
 - legacy `AGENT_EVENT_ALERT_RULES_JSON`：只兼容 `single_symbol` 的 `price_cross`、`price_change_percent`、`volume_spike` 三类基础规则；不支持 P5 技术指标、P6 watchlist/portfolio 或 P7 market light。系统不会自动迁移、删除或改写 legacy JSON。
 
 ### Docker

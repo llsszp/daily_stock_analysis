@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -72,14 +73,25 @@ from src.storage import (
 from src.utils.sanitize import sanitize_diagnostic_text
 
 
+TRAILING_STOP_ALERT_TYPE = "trailing_stop"
 LEGACY_RUNTIME_ALERT_TYPES = frozenset({"price_cross", "price_change_percent", "volume_spike"})
-SYMBOL_ALERT_TYPES = LEGACY_RUNTIME_ALERT_TYPES | TECHNICAL_ALERT_TYPES
+SYMBOL_ALERT_TYPES = LEGACY_RUNTIME_ALERT_TYPES | TECHNICAL_ALERT_TYPES | {TRAILING_STOP_ALERT_TYPE}
 SUPPORTED_ALERT_TYPES = SYMBOL_ALERT_TYPES | PORTFOLIO_ALERT_TYPES | MARKET_ALERT_TYPES
 SUPPORTED_TARGET_SCOPES = frozenset({"single_symbol", "watchlist", "portfolio_holdings", "portfolio_account", "market"})
 SUPPORTED_SEVERITIES = frozenset({"info", "warning", "critical"})
 NULLABLE_RULE_UPDATE_FIELDS = frozenset({"cooldown_policy", "notification_policy"})
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrailingStopAlert:
+    stock_code: str
+    activation_price: float
+    trail_mode: str
+    trail_value: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    alert_type: str = TRAILING_STOP_ALERT_TYPE
 
 
 class AlertServiceError(ValueError):
@@ -131,6 +143,11 @@ class AlertService:
         updated = self.repo.update_rule(rule_id, fields)
         if updated is None:
             raise AlertNotFoundError(f"Alert rule not found: {rule_id}")
+        if (
+            row.alert_type == TRAILING_STOP_ALERT_TYPE
+            or updated.alert_type == TRAILING_STOP_ALERT_TYPE
+        ) and {"target", "alert_type", "parameters"} & set(payload):
+            self.repo.delete_trailing_state(rule_id)
         return self._serialize_rule(updated)
 
     def delete_rule(self, rule_id: int) -> bool:
@@ -175,6 +192,10 @@ class AlertService:
             raise AlertNotFoundError(f"Alert rule not found: {rule_id}")
 
         payloads = self.build_runtime_payloads(row)
+        for payload in payloads:
+            metadata = getattr(payload.rule, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata["dry_run"] = True
         monitor = EventMonitor()
         try:
             if len(payloads) == 1 and row.target_scope == "single_symbol":
@@ -213,6 +234,8 @@ class AlertService:
             return await self._evaluate_price(rule, monitor)
         if isinstance(rule, PriceChangeAlert):
             return await self._evaluate_price_change(rule, monitor)
+        if isinstance(rule, TrailingStopAlert):
+            return await self._evaluate_trailing_stop(rule, monitor)
         if isinstance(rule, VolumeAlert):
             return await self._evaluate_volume(rule)
         if isinstance(rule, TechnicalIndicatorAlert):
@@ -370,6 +393,99 @@ class AlertService:
             threshold=threshold,
             data_source="realtime_quote",
             data_timestamp=self._extract_quote_datetime(quote),
+        )
+
+    async def _evaluate_trailing_stop(self, rule: TrailingStopAlert, monitor: EventMonitor) -> Dict[str, Any]:
+        try:
+            quote = await monitor._get_realtime_quote(rule.stock_code)
+        except Exception as exc:
+            return self._evaluation_error(
+                rule,
+                exc,
+                threshold=float(rule.activation_price),
+                data_source="realtime_quote",
+            )
+        if quote is None:
+            return self._not_triggered(
+                rule,
+                None,
+                "暂无可用实时行情",
+                record_status="skipped",
+                threshold=float(rule.activation_price),
+                data_source="realtime_quote",
+            )
+
+        try:
+            current_price = float(getattr(quote, "price", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            return self._evaluation_error(
+                rule,
+                exc,
+                threshold=float(rule.activation_price),
+                data_source="realtime_quote",
+                data_timestamp=self._extract_quote_datetime(quote),
+            )
+        data_timestamp = self._extract_quote_datetime(quote)
+        if current_price <= 0:
+            return self._not_triggered(
+                rule,
+                None,
+                "暂无有效实时价格",
+                record_status="skipped",
+                threshold=float(rule.activation_price),
+                data_source="realtime_quote",
+                data_timestamp=data_timestamp,
+            )
+
+        rule_id = self._runtime_rule_id(rule)
+        state = self.repo.get_trailing_state(rule_id=rule_id, target=rule.stock_code) if rule_id else None
+        is_activated = state is not None and state.activated_at is not None
+        if not is_activated and current_price < rule.activation_price:
+            return self._not_triggered(
+                rule,
+                current_price,
+                f"{rule.stock_code} 尚未达到启用价 {rule.activation_price:g}，当前 {current_price:g}",
+                threshold=float(rule.activation_price),
+                data_source="realtime_quote",
+                data_timestamp=data_timestamp,
+            )
+
+        previous_peak = float(state.peak_price or 0) if state is not None else 0.0
+        peak_price = max(previous_peak, current_price)
+        if rule.trail_mode == "amount":
+            trigger_price = peak_price - rule.trail_value
+            trail_description = f"{rule.trail_value:g}"
+        else:
+            trigger_price = peak_price * (1 - rule.trail_value / 100)
+            trail_description = f"{rule.trail_value:g}%"
+        trigger_price = max(0.0, trigger_price)
+
+        if rule_id and not bool(rule.metadata.get("dry_run")):
+            self.repo.upsert_trailing_state(
+                rule_id=rule_id,
+                target=rule.stock_code,
+                activated_at=state.activated_at if state is not None and state.activated_at else datetime.now(),
+                peak_price=peak_price,
+                last_price=current_price,
+                data_timestamp=data_timestamp,
+            )
+
+        if current_price <= trigger_price:
+            return self._triggered(
+                rule,
+                current_price,
+                f"{rule.stock_code} 跟踪止损触发：最高 {peak_price:g}，回撤 {trail_description}，当前 {current_price:g}",
+                threshold=trigger_price,
+                data_source="realtime_quote",
+                data_timestamp=data_timestamp,
+            )
+        return self._not_triggered(
+            rule,
+            current_price,
+            f"{rule.stock_code} 跟踪中：最高 {peak_price:g}，触发价 {trigger_price:g}，当前 {current_price:g}",
+            threshold=trigger_price,
+            data_source="realtime_quote",
+            data_timestamp=data_timestamp,
         )
 
     async def _evaluate_price_change(self, rule: PriceChangeAlert, monitor: EventMonitor) -> Dict[str, Any]:
@@ -691,6 +807,8 @@ class AlertService:
     def _threshold_for_rule(rule) -> Optional[float]:
         if isinstance(rule, PriceAlert):
             return float(rule.price)
+        if isinstance(rule, TrailingStopAlert):
+            return float(rule.activation_price)
         if isinstance(rule, PriceChangeAlert):
             return abs(float(rule.change_pct))
         if isinstance(rule, TechnicalIndicatorAlert):
@@ -705,7 +823,7 @@ class AlertService:
 
     @staticmethod
     def _data_source_for_rule(rule) -> Optional[str]:
-        if isinstance(rule, (PriceAlert, PriceChangeAlert)):
+        if isinstance(rule, (PriceAlert, PriceChangeAlert, TrailingStopAlert)):
             return "realtime_quote"
         if isinstance(rule, VolumeAlert):
             return "daily_data"
@@ -968,6 +1086,22 @@ class AlertService:
                 "change_pct": self._positive_float(parameters.get("change_pct"), "change_pct"),
             }
 
+        if alert_type == TRAILING_STOP_ALERT_TYPE:
+            trail_mode = str(parameters.get("trail_mode") or "percent").strip().lower()
+            if trail_mode not in {"amount", "percent"}:
+                raise AlertServiceError(f"invalid trail_mode: {trail_mode}")
+            trail_value = self._positive_float(parameters.get("trail_value"), "trail_value")
+            if trail_mode == "percent" and trail_value >= 100:
+                raise AlertServiceError("trail_value must be < 100 for percent mode")
+            return {
+                "activation_price": self._positive_float(
+                    parameters.get("activation_price"),
+                    "activation_price",
+                ),
+                "trail_mode": trail_mode,
+                "trail_value": trail_value,
+            }
+
         if alert_type == "volume_spike":
             return {"multiplier": self._positive_float(parameters.get("multiplier"), "multiplier")}
 
@@ -1127,6 +1261,14 @@ class AlertService:
                 change_pct=float(parameters["change_pct"]),
                 metadata=metadata,
             )
+        if data["alert_type"] == TRAILING_STOP_ALERT_TYPE:
+            return TrailingStopAlert(
+                stock_code=data["target"],
+                activation_price=float(parameters["activation_price"]),
+                trail_mode=str(parameters["trail_mode"]),
+                trail_value=float(parameters["trail_value"]),
+                metadata=metadata,
+            )
         if data["alert_type"] == "volume_spike":
             return VolumeAlert(
                 stock_code=data["target"],
@@ -1281,6 +1423,12 @@ class AlertService:
             return f"{target} price {parameters['direction']} {parameters['price']}"
         if alert_type == "price_change_percent":
             return f"{target} change {parameters['direction']} {parameters['change_pct']}%"
+        if alert_type == TRAILING_STOP_ALERT_TYPE:
+            trail_unit = "%" if parameters["trail_mode"] == "percent" else ""
+            return (
+                f"{target} trailing stop after {parameters['activation_price']} "
+                f"by {parameters['trail_value']}{trail_unit}"
+            )
         if alert_type == "volume_spike":
             return f"{target} volume spike {parameters['multiplier']}x"
         if alert_type == "ma_price_cross":

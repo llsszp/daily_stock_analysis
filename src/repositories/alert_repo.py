@@ -15,6 +15,7 @@ from src.storage import (
     AlertCooldownRecord,
     AlertNotificationRecord,
     AlertRuleRecord,
+    AlertTrailingStateRecord,
     AlertTriggerRecord,
     DatabaseManager,
 )
@@ -56,9 +57,57 @@ class AlertRepository:
 
     def delete_rule(self, rule_id: int) -> bool:
         with self.db.get_session() as session:
+            session.execute(delete(AlertTrailingStateRecord).where(AlertTrailingStateRecord.rule_id == rule_id))
             result = session.execute(delete(AlertRuleRecord).where(AlertRuleRecord.id == rule_id))
             session.commit()
             return bool(result.rowcount)
+
+    def get_trailing_state(self, *, rule_id: int, target: str) -> Optional[AlertTrailingStateRecord]:
+        with self.db.get_session() as session:
+            return session.execute(
+                select(AlertTrailingStateRecord)
+                .where(
+                    AlertTrailingStateRecord.rule_id == rule_id,
+                    AlertTrailingStateRecord.target == target,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+
+    def upsert_trailing_state(
+        self,
+        *,
+        rule_id: int,
+        target: str,
+        activated_at: datetime,
+        peak_price: float,
+        last_price: float,
+        data_timestamp: Optional[datetime],
+    ) -> AlertTrailingStateRecord:
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(AlertTrailingStateRecord)
+                .where(
+                    AlertTrailingStateRecord.rule_id == rule_id,
+                    AlertTrailingStateRecord.target == target,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                row = AlertTrailingStateRecord(rule_id=rule_id, target=target)
+                session.add(row)
+            row.activated_at = row.activated_at or activated_at
+            row.peak_price = peak_price
+            row.last_price = last_price
+            row.data_timestamp = data_timestamp
+            row.updated_at = datetime.now()
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def delete_trailing_state(self, rule_id: int) -> None:
+        with self.db.get_session() as session:
+            session.execute(delete(AlertTrailingStateRecord).where(AlertTrailingStateRecord.rule_id == rule_id))
+            session.commit()
 
     def list_rules(
         self,

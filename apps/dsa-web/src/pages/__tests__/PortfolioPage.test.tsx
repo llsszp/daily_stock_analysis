@@ -30,6 +30,9 @@ const {
   analyzePosition,
   listDecisionSignals,
   getLatestDecisionSignals,
+  createAlertRule,
+  listAlertRules,
+  getStockQuote,
 } = vi.hoisted(() => ({
   getAccounts: vi.fn(),
   getSnapshot: vi.fn(),
@@ -52,12 +55,28 @@ const {
   analyzePosition: vi.fn(),
   listDecisionSignals: vi.fn(),
   getLatestDecisionSignals: vi.fn(),
+  createAlertRule: vi.fn(),
+  listAlertRules: vi.fn(),
+  getStockQuote: vi.fn(),
 }));
 
 vi.mock('../../api/decisionSignals', () => ({
   decisionSignalsApi: {
     list: listDecisionSignals,
     getLatest: getLatestDecisionSignals,
+  },
+}));
+
+vi.mock('../../api/alerts', () => ({
+  alertsApi: {
+    createRule: createAlertRule,
+    listRules: listAlertRules,
+  },
+}));
+
+vi.mock('../../api/stocks', () => ({
+  stocksApi: {
+    getQuote: getStockQuote,
   },
 }));
 
@@ -333,6 +352,19 @@ describe('PortfolioPage FX refresh', () => {
       message: '分析任务已加入队列: HK00700',
       analysisPhase: 'auto',
     });
+    createAlertRule.mockResolvedValue({
+      id: 88,
+      name: '600519 跟踪止损',
+      targetScope: 'single_symbol',
+      target: '600519',
+      alertType: 'trailing_stop',
+      parameters: { activationPrice: 1600, trailMode: 'percent', trailValue: 5 },
+      severity: 'warning',
+      enabled: true,
+      source: 'api',
+    });
+    listAlertRules.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 1 });
+    getStockQuote.mockResolvedValue({ stockCode: '600519', currentPrice: 1600 });
     getLatestDecisionSignals.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 1 });
   });
 
@@ -352,6 +384,57 @@ describe('PortfolioPage FX refresh', () => {
 
     expect(getSnapshot).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
     expect(getRisk).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
+  });
+
+  it('defaults profitable positions to a trailing-stop alert at the current price', async () => {
+    getSnapshot.mockResolvedValue(makeSnapshot({ positions: [makePosition()] }));
+    render(<PortfolioPage />);
+
+    await screen.findByText('600519');
+    expect(await screen.findByText('未创建')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+
+    expect(screen.getByLabelText('规则类型')).toHaveValue('trailing_stop');
+    expect(screen.getByLabelText('高于此价格后开始跟踪')).toHaveValue(1600);
+    expect(screen.getByLabelText('从最高价回撤比例（%）')).toHaveValue(5);
+    fireEvent.click(screen.getByRole('button', { name: '创建并启用' }));
+
+    await waitFor(() => expect(createAlertRule).toHaveBeenCalledWith({
+      name: '600519 跟踪止损',
+      targetScope: 'single_symbol',
+      target: '600519',
+      alertType: 'trailing_stop',
+      parameters: { activationPrice: 1600, trailMode: 'percent', trailValue: 5 },
+      severity: 'warning',
+      enabled: true,
+    }));
+    expect(await screen.findByText(/可在告警模块中查看/)).toBeInTheDocument();
+  });
+
+  it('shows the number of existing alert rules for each position', async () => {
+    listAlertRules.mockResolvedValue({ items: [], total: 2, page: 1, pageSize: 1 });
+    getSnapshot.mockResolvedValue(makeSnapshot({ positions: [makePosition()] }));
+    render(<PortfolioPage />);
+
+    expect(await screen.findByText('已创建 2 条')).toBeInTheDocument();
+    expect(listAlertRules).toHaveBeenCalledWith({ target: '600519', page: 1, pageSize: 1 });
+  });
+
+  it('defaults losing positions to an alert above the average cost', async () => {
+    getStockQuote.mockResolvedValueOnce({ stockCode: '600519', currentPrice: 1400 });
+    getSnapshot.mockResolvedValue(makeSnapshot({ positions: [makePosition({
+      lastPrice: 1400,
+      marketValueBase: 1400,
+      unrealizedPnlBase: -100,
+      unrealizedPnlPct: -6.67,
+    })] }));
+    render(<PortfolioPage />);
+
+    await screen.findByText('600519');
+    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+
+    expect(screen.getByLabelText('规则类型')).toHaveValue('price_cross');
+    expect(screen.getByLabelText('目标价格')).toHaveValue(1500);
   });
 
   it('renders stale FX status with a manual refresh button', async () => {
@@ -574,8 +657,8 @@ describe('PortfolioPage FX refresh', () => {
 
     const hkRowCells = within(hkRow as HTMLTableRowElement).getAllByRole('cell');
     const aaplRowCells = within(aaplRow as HTMLTableRowElement).getAllByRole('cell');
-    expect(hkRowCells.at(-3)).toHaveClass('text-success');
-    expect(aaplRowCells.at(-3)).toHaveClass('text-secondary');
+    expect(hkRowCells.at(-4)).toHaveClass('text-success');
+    expect(aaplRowCells.at(-4)).toHaveClass('text-secondary');
   });
 
   it('loads latest active signals for holdings without scanning paginated signal lists', async () => {

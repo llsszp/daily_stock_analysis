@@ -981,6 +981,25 @@ class AlertCooldownRecord(Base):
     )
 
 
+class AlertTrailingStateRecord(Base):
+    """Persistent high-water mark for trailing-stop alert rules."""
+
+    __tablename__ = 'alert_trailing_states'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, nullable=False, index=True)
+    target = Column(String(64), nullable=False, index=True)
+    activated_at = Column(DateTime, index=True)
+    peak_price = Column(Float)
+    last_price = Column(Float)
+    data_timestamp = Column(DateTime, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('rule_id', 'target', name='uix_alert_trailing_state_rule_target'),
+    )
+
+
 class DecisionSignalRecord(Base):
     """Persisted AI decision signal asset for Issue #1390 P1."""
 

@@ -41,6 +41,13 @@ function formatParameters(rule: AlertRuleItem, language: UiLanguage): string {
   if (rule.alertType === 'price_cross') {
     return `${rule.parameters.direction === 'below' ? directionLabels.belowPrice : directionLabels.abovePrice} ${rule.parameters.price ?? '--'}`;
   }
+  if (rule.alertType === 'trailing_stop') {
+    const trailValue = rule.parameters.trailValue ?? '--';
+    const suffix = rule.parameters.trailMode === 'percent' ? '%' : '';
+    return language === 'zh'
+      ? `启用价 ${rule.parameters.activationPrice ?? '--'} · 最高价回撤 ${trailValue}${suffix}`
+      : `Activate ${rule.parameters.activationPrice ?? '--'} · Peak drawdown ${trailValue}${suffix}`;
+  }
   if (rule.alertType === 'price_change_percent') {
     return `${rule.parameters.direction === 'down' ? directionLabels.downChange : directionLabels.upChange} ${rule.parameters.changePct ?? '--'}%`;
   }

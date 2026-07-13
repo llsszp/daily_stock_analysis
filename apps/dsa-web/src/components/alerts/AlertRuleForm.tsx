@@ -9,6 +9,7 @@ import type {
   MarketLightStatus,
   MarketRegion,
   PortfolioStopLossMode,
+  TrailingStopMode,
 } from '../../types/alerts';
 import type { PortfolioAccountItem } from '../../types/portfolio';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
@@ -33,6 +34,7 @@ import { Button, Card, Checkbox, Input, Select } from '../common';
 
 const SYMBOL_ALERT_TYPE_OPTIONS = [
   { value: 'price_cross', label: '价格突破' },
+  { value: 'trailing_stop', label: '跟踪止损' },
   { value: 'price_change_percent', label: '涨跌幅' },
   { value: 'volume_spike', label: '成交量放大' },
   { value: 'ma_price_cross', label: '价格均线穿越' },
@@ -143,6 +145,9 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
   const [crossDirection, setCrossDirection] = useState<'bullish_cross' | 'bearish_cross'>('bullish_cross');
   const [stopLossMode, setStopLossMode] = useState<PortfolioStopLossMode>('near');
   const [price, setPrice] = useState('');
+  const [activationPrice, setActivationPrice] = useState('');
+  const [trailMode, setTrailMode] = useState<TrailingStopMode>('percent');
+  const [trailValue, setTrailValue] = useState('5');
   const [changePct, setChangePct] = useState('');
   const [multiplier, setMultiplier] = useState('');
   const [window, setWindow] = useState('20');
@@ -189,6 +194,10 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
     if (nextType === 'price_cross') {
       setPriceDirection('above');
       setPrice('');
+    } else if (nextType === 'trailing_stop') {
+      setActivationPrice('');
+      setTrailMode('percent');
+      setTrailValue('5');
     } else if (nextType === 'price_change_percent') {
       setChangeDirection('up');
       setChangePct('');
@@ -286,6 +295,17 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
       const parsedPrice = parsePositiveNumber(price, text.priceThreshold);
       if (parsedPrice == null) return null;
       return { direction: priceDirection, price: parsedPrice };
+    }
+    if (alertType === 'trailing_stop') {
+      const parsedActivationPrice = parsePositiveNumber(activationPrice, text.activationPrice);
+      const trailValueLabel = trailMode === 'percent' ? text.trailValuePercent : text.trailValueAmount;
+      const parsedTrailValue = parsePositiveNumber(trailValue, trailValueLabel);
+      if (parsedActivationPrice == null || parsedTrailValue == null) return null;
+      if (trailMode === 'percent' && parsedTrailValue >= 100) {
+        setFormError(language === 'zh' ? '最高价回撤比例必须小于 100%' : 'Peak drawdown must be less than 100%');
+        return null;
+      }
+      return { activationPrice: parsedActivationPrice, trailMode, trailValue: parsedTrailValue };
     }
     if (alertType === 'price_change_percent') {
       const parsedChangePct = parsePositiveNumber(changePct, text.changePctThreshold);
@@ -405,6 +425,9 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
     setPortfolioTarget('all');
     setMarketRegion('cn');
     setPrice('');
+    setActivationPrice('');
+    setTrailMode('percent');
+    setTrailValue('5');
     setChangePct('');
     setMultiplier('');
     setWindow('20');
@@ -523,6 +546,38 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
               step="0.0001"
               value={price}
               onChange={(event) => setPrice(event.target.value)}
+              disabled={isSubmitting}
+            />
+          </div>
+        ) : null}
+
+        {alertType === 'trailing_stop' ? (
+          <div className="grid gap-4 md:grid-cols-3">
+            <Input
+              label={text.activationPrice}
+              type="number"
+              min="0"
+              step="0.0001"
+              value={activationPrice}
+              onChange={(event) => setActivationPrice(event.target.value)}
+              disabled={isSubmitting}
+            />
+            <Select
+              label={text.trailMode}
+              value={trailMode}
+              options={language === 'zh'
+                ? [{ value: 'percent', label: '按比例' }, { value: 'amount', label: '按金额' }]
+                : [{ value: 'percent', label: 'Percent' }, { value: 'amount', label: 'Amount' }]}
+              disabled={isSubmitting}
+              onChange={(value) => setTrailMode(value as TrailingStopMode)}
+            />
+            <Input
+              label={trailMode === 'percent' ? text.trailValuePercent : text.trailValueAmount}
+              type="number"
+              min="0"
+              step="0.01"
+              value={trailValue}
+              onChange={(event) => setTrailValue(event.target.value)}
               disabled={isSubmitting}
             />
           </div>

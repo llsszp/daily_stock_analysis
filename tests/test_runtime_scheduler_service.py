@@ -393,15 +393,21 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             _NoopThread,
         ), patch("src.services.alert_worker.AlertWorker", return_value=fake_worker):
             service.start()
+            scheduler = service._scheduler
+            self.assertIsNotNone(scheduler)
+            self.assertEqual(len(scheduler.background_tasks), 1)  # type: ignore[attr-defined]
+            self.assertEqual(scheduler.background_tasks[0]["name"], "agent_event_monitor")  # type: ignore[index]
+            self.assertEqual(scheduler.background_tasks[0]["interval_seconds"], 7 * 60)  # type: ignore[index]
+            self.assertEqual(scheduler.background_tasks[0]["run_immediately"], True)  # type: ignore[index]
+            scheduler.background_tasks[0]["task"]()  # type: ignore[index]
+            fake_worker.run_once.assert_called_once()
 
-        scheduler = service._scheduler
-        self.assertIsNotNone(scheduler)
-        self.assertEqual(len(scheduler.background_tasks), 1)  # type: ignore[attr-defined]
-        self.assertEqual(scheduler.background_tasks[0]["name"], "agent_event_monitor")  # type: ignore[index]
-        self.assertEqual(scheduler.background_tasks[0]["interval_seconds"], 7 * 60)  # type: ignore[index]
-        self.assertEqual(scheduler.background_tasks[0]["run_immediately"], True)  # type: ignore[index]
-        scheduler.background_tasks[0]["task"]()  # type: ignore[index]
-        fake_worker.run_once.assert_called_once()
+            config.schedule_enabled = False
+            service.start()
+            alert_only_scheduler = service._scheduler
+            self.assertIsNotNone(alert_only_scheduler)
+            self.assertIsNone(alert_only_scheduler.daily_task)  # type: ignore[attr-defined]
+            self.assertEqual(len(alert_only_scheduler.background_tasks), 1)  # type: ignore[attr-defined]
 
     def test_rebuild_reuses_event_monitor_without_immediate_rerun(self) -> None:
         schedulers = []

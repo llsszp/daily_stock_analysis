@@ -162,6 +162,43 @@ describe('alertsApi', () => {
     });
   });
 
+  it('creates trailing-stop rules with snake_case parameters', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        id: 8,
+        name: 'AAPL trailing stop',
+        target_scope: 'single_symbol',
+        target: 'AAPL',
+        alert_type: 'trailing_stop',
+        parameters: { activation_price: 200, trail_mode: 'percent', trail_value: 5 },
+        severity: 'warning',
+        enabled: true,
+        source: 'api',
+      },
+    });
+
+    const created = await alertsApi.createRule({
+      name: 'AAPL trailing stop',
+      targetScope: 'single_symbol',
+      target: 'AAPL',
+      alertType: 'trailing_stop',
+      parameters: { activationPrice: 200, trailMode: 'percent', trailValue: 5 },
+      severity: 'warning',
+      enabled: true,
+    });
+
+    expect(post).toHaveBeenCalledWith('/api/v1/alerts/rules', {
+      name: 'AAPL trailing stop',
+      target_scope: 'single_symbol',
+      target: 'AAPL',
+      alert_type: 'trailing_stop',
+      parameters: { activation_price: 200, trail_mode: 'percent', trail_value: 5 },
+      severity: 'warning',
+      enabled: true,
+    });
+    expect(created.parameters.trailMode).toBe('percent');
+  });
+
   it('creates market light rules with market scope and min_drop parameter fields', async () => {
     post
       .mockResolvedValueOnce({

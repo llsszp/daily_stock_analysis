@@ -183,9 +183,10 @@ class EventMonitor:
     and can be forwarded to the notification system.
     """
 
-    def __init__(self):
+    def __init__(self, fetcher_manager: Any = None):
         self.rules: List[AlertRule] = []
         self._callbacks: List[Callable[[TriggeredAlert], None]] = []
+        self._fetcher_manager = fetcher_manager
 
     def add_alert(self, rule: AlertRule) -> None:
         """Register a new alert rule."""
@@ -260,10 +261,18 @@ class EventMonitor:
         # implemented as hooks for future extension
         return None
 
-    def _fetch_realtime_quote(self, stock_code: str) -> Any:
-        from data_provider import DataFetcherManager
+    def _get_fetcher_manager(self):
+        if self._fetcher_manager is None:
+            from data_provider import DataFetcherManager
 
-        return DataFetcherManager().get_realtime_quote(stock_code)
+            self._fetcher_manager = DataFetcherManager()
+        return self._fetcher_manager
+
+    def prefetch_realtime_quotes(self, stock_codes: List[str]) -> int:
+        return int(self._get_fetcher_manager().prefetch_realtime_quotes(stock_codes) or 0)
+
+    def _fetch_realtime_quote(self, stock_code: str) -> Any:
+        return self._get_fetcher_manager().get_realtime_quote(stock_code, supplement=False)
 
     async def _get_realtime_quote(self, stock_code: str) -> Any:
         return await asyncio.to_thread(self._fetch_realtime_quote, stock_code)

@@ -141,6 +141,16 @@ class AlertWorker:
             return stats
 
         monitor = EventMonitor()
+        realtime_symbols = sorted({
+            str(getattr(runtime_rule.rule, "stock_code", "") or "").strip()
+            for runtime_rule in runtime_rules
+            if str(getattr(runtime_rule.rule, "stock_code", "") or "").strip()
+        })
+        if len(realtime_symbols) >= 5:
+            try:
+                monitor.prefetch_realtime_quotes(realtime_symbols)
+            except Exception as exc:
+                logger.warning("[AlertWorker] Failed to prefetch realtime quotes: %s", exc)
         daily_cache: Dict[Any, Any] = {}
         self._analysis_visibility_cache = {}
         for runtime_rule in runtime_rules:

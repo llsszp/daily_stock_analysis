@@ -31,6 +31,9 @@ function toSnakeRulePayload(payload: AlertRuleCreateRequest): Record<string, unk
     request.parameters = omitUndefined({
       direction: payload.parameters.direction,
       price: payload.parameters.price,
+      activation_price: payload.parameters.activationPrice,
+      trail_mode: payload.parameters.trailMode,
+      trail_value: payload.parameters.trailValue,
       change_pct: payload.parameters.changePct,
       multiplier: payload.parameters.multiplier,
       window: payload.parameters.window,

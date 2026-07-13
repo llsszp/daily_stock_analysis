@@ -12,7 +12,29 @@ export type ExtractFromImageResponse = {
   rawText?: string;
 };
 
+export type StockQuoteResponse = {
+  stockCode: string;
+  stockName?: string | null;
+  currentPrice: number;
+  change?: number | null;
+  changePercent?: number | null;
+};
+
 export const stocksApi = {
+  async getQuote(stockCode: string): Promise<StockQuoteResponse> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/stocks/${encodeURIComponent(stockCode)}/quote`,
+    );
+    const data = response.data;
+    return {
+      stockCode: String(data.stock_code ?? stockCode),
+      stockName: data.stock_name == null ? null : String(data.stock_name),
+      currentPrice: Number(data.current_price ?? 0),
+      change: data.change == null ? null : Number(data.change),
+      changePercent: data.change_percent == null ? null : Number(data.change_percent),
+    };
+  },
+
   async extractFromImage(file: File): Promise<ExtractFromImageResponse> {
     const formData = new FormData();
     formData.append('file', file);

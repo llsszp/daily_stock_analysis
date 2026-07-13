@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 
 from src.config import Config
+from src.agent.events import EventMonitor
 from src.notification import ChannelAttemptResult, NotificationDispatchResult
 from src.services.alert_indicators import (
     _calculate_rsi,
@@ -315,6 +317,40 @@ class AlertWorkerTestCase(unittest.TestCase):
         else:
             notifier.send_with_results.side_effect = list(results)
         return notifier
+
+    def test_trailing_stop_persists_peak_and_triggers_on_percent_drawdown(self) -> None:
+        created = self._create_rule(
+            name="AAPL trailing stop",
+            target="AAPL",
+            alert_type="trailing_stop",
+            parameters={
+                "activation_price": 100,
+                "trail_mode": "percent",
+                "trail_value": 5,
+            },
+        )
+        row = self.service.repo.get_rule(created["id"])
+        self.assertIsNotNone(row)
+        runtime_rule = self.service.build_runtime_payloads(row)[0].rule
+        monitor = EventMonitor()
+        monitor._get_realtime_quote = AsyncMock(side_effect=[
+            SimpleNamespace(price=100.0),
+            SimpleNamespace(price=110.0),
+            SimpleNamespace(price=104.0),
+        ])
+
+        activated = asyncio.run(self.service._evaluate_rule(runtime_rule, monitor))
+        raised = asyncio.run(self.service._evaluate_rule(runtime_rule, monitor))
+        triggered = asyncio.run(self.service._evaluate_rule(runtime_rule, monitor))
+
+        self.assertFalse(activated["triggered"])
+        self.assertFalse(raised["triggered"])
+        self.assertTrue(triggered["triggered"])
+        self.assertAlmostEqual(triggered["threshold"], 104.5)
+        state = self.service.repo.get_trailing_state(rule_id=created["id"], target="AAPL")
+        self.assertIsNotNone(state)
+        self.assertAlmostEqual(state.peak_price, 110.0)
+        self.assertAlmostEqual(state.last_price, 104.0)
 
     def test_p6_triggered_stock_alert_links_latest_active_decision_signal(self) -> None:
         self._create_rule(target="600519")

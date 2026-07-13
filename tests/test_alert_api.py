@@ -629,6 +629,52 @@ class AlertApiTestCase(unittest.TestCase):
         self.assertEqual(payload["status"], "not_triggered")
         self.assertEqual(payload["observed_value"], 1700.0)
 
+    def test_trailing_stop_rule_dry_run_does_not_mutate_peak_state(self) -> None:
+        rule = self._create_rule({
+            "name": "AAPL trailing stop",
+            "target": "AAPL",
+            "alert_type": "trailing_stop",
+            "parameters": {
+                "activation_price": 200,
+                "trail_mode": "percent",
+                "trail_value": 5,
+            },
+        })
+        self.assertEqual(rule["parameters"], {
+            "activation_price": 200.0,
+            "trail_mode": "percent",
+            "trail_value": 5.0,
+        })
+
+        with patch(
+            "src.agent.events.EventMonitor._get_realtime_quote",
+            new=AsyncMock(return_value=SimpleNamespace(price=210.0)),
+        ):
+            resp = self.client.post(f"/api/v1/alerts/rules/{rule['id']}/test")
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        payload = resp.json()
+        self.assertFalse(payload["triggered"])
+        self.assertEqual(payload["observed_value"], 210.0)
+        self.assertIn("跟踪中", payload["message"])
+        self.assertIsNone(
+            AlertRepository(self.db).get_trailing_state(rule_id=rule["id"], target="AAPL")
+        )
+
+    def test_trailing_stop_rejects_invalid_percent(self) -> None:
+        resp = self.client.post("/api/v1/alerts/rules", json={
+            "target_scope": "single_symbol",
+            "target": "AAPL",
+            "alert_type": "trailing_stop",
+            "parameters": {
+                "activation_price": 200,
+                "trail_mode": "percent",
+                "trail_value": 100,
+            },
+        })
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertEqual(resp.json()["error"], "validation_error")
+
     def test_dry_run_quote_exception_returns_evaluation_error_and_sanitizes_message(self) -> None:
         rule = self._create_rule()
 

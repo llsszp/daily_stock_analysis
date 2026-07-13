@@ -208,6 +208,11 @@ class RuntimeSchedulerService:
     def _is_schedule_enabled(self, config: Config) -> bool:
         return self._force_enabled or bool(getattr(config, "schedule_enabled", False))
 
+    def _is_runtime_enabled(self, config: Config) -> bool:
+        return self._is_schedule_enabled(config) or bool(
+            getattr(config, "agent_event_monitor_enabled", False)
+        )
+
     def _current_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         if self._background_tasks_provider is not None:
             return self._background_tasks_provider(config)
@@ -267,9 +272,10 @@ class RuntimeSchedulerService:
                 self.stop()
                 return
             config = self._config_provider()
-            if not self._is_schedule_enabled(config):
+            if not self._is_runtime_enabled(config):
                 self.stop()
                 return
+            schedule_enabled = self._is_schedule_enabled(config)
             background_tasks = self._current_background_tasks(config)
             self.stop()
             times = normalize_schedule_times(
@@ -282,10 +288,11 @@ class RuntimeSchedulerService:
                 schedule_times_provider=self._current_times,
                 register_signals=False,
             )
-            if run_immediately and self._run_immediately_in_background:
-                scheduler.set_daily_task(self._run_analysis_once, run_immediately=False)
-            else:
-                scheduler.set_daily_task(self._run_analysis_once, run_immediately=run_immediately)
+            if schedule_enabled:
+                if run_immediately and self._run_immediately_in_background:
+                    scheduler.set_daily_task(self._run_analysis_once, run_immediately=False)
+                else:
+                    scheduler.set_daily_task(self._run_analysis_once, run_immediately=run_immediately)
             for entry in background_tasks:
                 scheduler.add_background_task(
                     entry["task"],
@@ -293,7 +300,7 @@ class RuntimeSchedulerService:
                     run_immediately=entry.get("run_immediately", False),
                     name=entry.get("name"),
                 )
-            if run_immediately and self._run_immediately_in_background:
+            if schedule_enabled and run_immediately and self._run_immediately_in_background:
                 self._run_in_background_thread(self._run_analysis_once)
             thread = threading.Thread(
                 target=scheduler.run,
@@ -325,7 +332,7 @@ class RuntimeSchedulerService:
             self.stop()
             return
         config = self._config_provider()
-        if self._is_schedule_enabled(config):
+        if self._is_runtime_enabled(config):
             self.start(run_immediately=run_immediately)
         else:
             self.stop()

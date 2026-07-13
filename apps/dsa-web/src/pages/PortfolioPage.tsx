@@ -1,12 +1,15 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BellPlus } from 'lucide-react';
 import { Pie, PieChart, ResponsiveContainer, Tooltip, Legend, Cell } from 'recharts';
 import { decisionSignalsApi } from '../api/decisionSignals';
+import { alertsApi } from '../api/alerts';
 import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
 import { PortfolioSignalSummary } from '../components/decision-signals/DecisionSignalDisplay';
+import { PositionAlertDialog } from '../components/portfolio/PositionAlertDialog';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText } from '../i18n/uiText';
 import { PORTFOLIO_TEXT } from '../locales/featureText';
@@ -218,6 +221,10 @@ const PortfolioPage: React.FC = () => {
   const portfolioSignalsRequestRef = useRef(0);
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
+  const [alertPosition, setAlertPosition] = useState<FlatPosition | null>(null);
+  const [alertCreateMessage, setAlertCreateMessage] = useState<string | null>(null);
+  const [positionAlertCounts, setPositionAlertCounts] = useState<Record<string, number | null>>({});
+  const positionAlertCountsRequestRef = useRef(0);
 
   const [brokers, setBrokers] = useState<PortfolioImportBrokerItem[]>([]);
   const [selectedBroker, setSelectedBroker] = useState('huatai');
@@ -481,6 +488,33 @@ const PortfolioPage: React.FC = () => {
     rows.sort((a, b) => Number(b.marketValueBase || 0) - Number(a.marketValueBase || 0));
     return rows;
   }, [snapshot]);
+
+  useEffect(() => {
+    const symbols = Array.from(new Set(
+      positionRows
+        .map((row) => normalizeStockCode(row.symbol).toUpperCase())
+        .filter(Boolean),
+    ));
+    const requestId = positionAlertCountsRequestRef.current + 1;
+    positionAlertCountsRequestRef.current = requestId;
+    if (symbols.length === 0) {
+      setPositionAlertCounts({});
+      return;
+    }
+
+    setPositionAlertCounts(Object.fromEntries(symbols.map((symbol) => [symbol, null])));
+    void mapWithConcurrency(symbols, 6, async (symbol) => {
+      try {
+        const response = await alertsApi.listRules({ target: symbol, page: 1, pageSize: 1 });
+        return { symbol, count: response.total };
+      } catch {
+        return { symbol, count: -1 };
+      }
+    }).then((results) => {
+      if (positionAlertCountsRequestRef.current !== requestId) return;
+      setPositionAlertCounts(Object.fromEntries(results.map((item) => [item.symbol, item.count])));
+    });
+  }, [positionRows]);
 
   const snapshotMatchesAccountScope = useMemo(() => {
     if (!snapshot) return false;
@@ -1057,6 +1091,14 @@ const PortfolioPage: React.FC = () => {
           message={positionAnalysisMessage}
         />
       ) : null}
+      {alertCreateMessage ? (
+        <InlineAlert
+          variant="success"
+          title={language === 'zh' ? '告警规则已创建' : 'Alert rule created'}
+          message={alertCreateMessage}
+          className="rounded-xl px-3 py-2 text-xs shadow-none"
+        />
+      ) : null}
 
       {(showCreateAccount || !hasAccounts) ? (
         <Card padding="md">
@@ -1200,7 +1242,7 @@ const PortfolioPage: React.FC = () => {
             />
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-[860px] w-full text-sm">
+              <table className="min-w-[960px] w-full text-sm">
                 <thead className="text-xs text-secondary border-b border-white/10">
                   <tr>
                     <th className="text-left py-2 pr-2">{text.account}</th>
@@ -1212,6 +1254,7 @@ const PortfolioPage: React.FC = () => {
                     <th className="text-right py-2 pr-3">{text.unrealizedPnl}</th>
                     <th className="text-right py-2 pr-3">{text.returnPct}</th>
                     <th className="min-w-[9rem] text-right py-2 pr-3">{t('decisionSignals.portfolioColumn')}</th>
+                    <th className="w-20 text-right py-2 pr-2">{language === 'zh' ? '告警' : 'Alert'}</th>
                     <th className="w-20 text-right py-2">{text.action}</th>
                   </tr>
                 </thead>
@@ -1220,6 +1263,7 @@ const PortfolioPage: React.FC = () => {
                     const rowKey = `${row.accountId}-${row.symbol}-${row.market}`;
                     const analyzing = positionAnalysisLoadingKey === rowKey;
                     const signal = signalByPositionKey.get(rowKey);
+                    const alertCount = positionAlertCounts[normalizeStockCode(row.symbol).toUpperCase()];
                     return (
                     <tr key={rowKey} className="border-b border-white/5">
                       <td className="py-2 pr-2 text-secondary">{row.accountName}</td>
@@ -1257,6 +1301,28 @@ const PortfolioPage: React.FC = () => {
                       </td>
                       <td className="py-2 pr-3 text-right align-top">
                         <PortfolioSignalSummary item={signal} loading={portfolioSignalsLoading} />
+                      </td>
+                      <td className="py-2 pr-2 text-right align-top">
+                        <div className={`mb-1 text-[11px] ${typeof alertCount === 'number' && alertCount > 0 ? 'text-success' : 'text-secondary'}`}>
+                          {alertCount === null || alertCount === undefined
+                            ? (language === 'zh' ? '查询中' : 'Loading')
+                            : alertCount < 0
+                              ? '--'
+                              : alertCount > 0
+                                ? (language === 'zh' ? `已创建 ${alertCount} 条` : `${alertCount} created`)
+                                : (language === 'zh' ? '未创建' : 'None')}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAlertPosition(row);
+                            setAlertCreateMessage(null);
+                          }}
+                          className="btn-secondary inline-flex items-center gap-1 px-2 py-1 text-xs"
+                        >
+                          <BellPlus className="h-3.5 w-3.5" />
+                          {language === 'zh' ? '创建' : 'Create'}
+                        </button>
                       </td>
                       <td className="py-2 text-right">
                         <button
@@ -1675,6 +1741,23 @@ const PortfolioPage: React.FC = () => {
           if (!accountDeleteLoading) {
             setPendingAccountDelete(null);
           }
+        }}
+      />
+      <PositionAlertDialog
+        position={alertPosition}
+        onClose={() => setAlertPosition(null)}
+        onCreated={(rule) => {
+          setAlertPosition(null);
+          const alertKey = normalizeStockCode(rule.target).toUpperCase();
+          setPositionAlertCounts((current) => ({
+            ...current,
+            [alertKey]: Math.max(0, current[alertKey] ?? 0) + 1,
+          }));
+          setAlertCreateMessage(
+            language === 'zh'
+              ? `已创建并启用「${rule.name}」，可在告警模块中查看。`
+              : `Created and enabled "${rule.name}". It is now visible in Alerts.`,
+          );
         }}
       />
     </div>

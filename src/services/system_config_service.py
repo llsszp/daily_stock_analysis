@@ -2059,6 +2059,8 @@ class SystemConfigService:
             "SCHEDULE_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_TIMES",
+            "AGENT_EVENT_MONITOR_ENABLED",
+            "AGENT_EVENT_MONITOR_INTERVAL_MINUTES",
         }:
             try:
                 self._runtime_scheduler.reconcile_from_config(

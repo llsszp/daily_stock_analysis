@@ -75,6 +75,24 @@ describe('AlertRuleForm', () => {
     });
   });
 
+  it('submits a trailing-stop rule payload', async () => {
+    render(<AlertRuleForm onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText('标的代码'), { target: { value: 'aapl' } });
+    fireEvent.change(screen.getByLabelText('规则类型'), { target: { value: 'trailing_stop' } });
+    fireEvent.change(screen.getByLabelText('启用跟踪价格'), { target: { value: '200' } });
+    fireEvent.change(screen.getByLabelText('最高价回撤比例（%）'), { target: { value: '6' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建规则' }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        target: 'AAPL',
+        alertType: 'trailing_stop',
+        parameters: { activationPrice: 200, trailMode: 'percent', trailValue: 6 },
+      }));
+    });
+  });
+
   it('submits a volume_spike rule payload and supports disabled creation', async () => {
     render(<AlertRuleForm onSubmit={onSubmit} />);
 
