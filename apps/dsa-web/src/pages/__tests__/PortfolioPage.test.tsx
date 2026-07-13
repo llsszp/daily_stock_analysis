@@ -625,6 +625,8 @@ describe('PortfolioPage FX refresh', () => {
 
     expect(await screen.findByText('新 AI 风险')).toBeInTheDocument();
     await waitFor(() => expect(getLatestDecisionSignals).toHaveBeenCalledTimes(2));
+    expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true });
+    expect(getRisk).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true });
     expect(screen.queryByText('旧 AI 风险')).not.toBeInTheDocument();
   });
 

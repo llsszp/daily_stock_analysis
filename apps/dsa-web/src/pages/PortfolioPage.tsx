@@ -338,14 +338,14 @@ const PortfolioPage: React.FC = () => {
     }
   }, [selectedBroker]);
 
-  const loadSnapshotAndRisk = useCallback(async () => {
+  const loadSnapshotAndRisk = useCallback(async (includeRealtime = false) => {
     setIsLoading(true);
     setRiskWarning(null);
     try {
       const snapshotData = await portfolioApi.getSnapshot({
         accountId: queryAccountId,
         costMethod,
-        includeRealtime: false,
+        includeRealtime,
       });
       setSnapshot(snapshotData);
       setError(null);
@@ -354,7 +354,7 @@ const PortfolioPage: React.FC = () => {
         const riskData = await portfolioApi.getRisk({
           accountId: queryAccountId,
           costMethod,
-          includeRealtime: false,
+          includeRealtime,
         });
         setRisk(riskData);
       } catch (riskErr) {
@@ -837,7 +837,7 @@ const PortfolioPage: React.FC = () => {
   };
 
   const handleRefresh = async () => {
-    await Promise.all([loadAccounts(), loadSnapshotAndRisk(), loadEvents(), loadBrokers()]);
+    await Promise.all([loadAccounts(), loadSnapshotAndRisk(true), loadEvents(), loadBrokers()]);
     setPortfolioSignalsRefreshKey((current) => current + 1);
   };
 

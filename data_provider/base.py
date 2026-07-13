@@ -1653,6 +1653,19 @@ class DataFetcherManager:
             )
             return 0
 
+    def get_prefetched_realtime_quote(self, stock_code: str):
+        """Return a Longbridge quote only when the batch-prefetch cache contains it."""
+        longbridge = self._get_fetcher_by_name("LongbridgeFetcher", capability="realtime_quote")
+        if longbridge is None:
+            return None
+        return self._call_fetcher_method(
+            longbridge,
+            "get_realtime_quote",
+            normalize_stock_code(stock_code),
+            include_volume_ratio=False,
+            cache_only=True,
+        )
+
     def prefetch_daily_klines(self, stock_codes: List[str], days: int = 30) -> int:
         """Batch-prefetch TickFlow daily K-lines without changing per-stock callers."""
         fetcher = self._get_fetcher_by_name("TickFlowFetcher", capability="daily_data")

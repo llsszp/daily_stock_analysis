@@ -286,8 +286,13 @@ class PortfolioServiceTestCase(unittest.TestCase):
                 self._fetcher_call_lock = threading.Lock()
                 manager_instances.append(self)
 
-            def get_realtime_quote(self, symbol: str, log_final_failure: bool = True) -> SimpleNamespace:
-                del log_final_failure
+            def get_realtime_quote(
+                self,
+                symbol: str,
+                log_final_failure: bool = True,
+                supplement: bool = True,
+            ) -> SimpleNamespace:
+                del log_final_failure, supplement
                 with self._fetcher_call_lock:
                     with lock:
                         called_symbols.append(symbol)
@@ -355,8 +360,13 @@ class PortfolioServiceTestCase(unittest.TestCase):
                 # "cache fully filled" signal the previous implementation trusted.
                 return len(stock_codes)
 
-            def get_realtime_quote(self, symbol: str, log_final_failure: bool = True) -> SimpleNamespace:
-                del log_final_failure
+            def get_realtime_quote(
+                self,
+                symbol: str,
+                log_final_failure: bool = True,
+                supplement: bool = True,
+            ) -> SimpleNamespace:
+                del log_final_failure, supplement
                 with self._fetcher_call_lock:
                     with lock:
                         fetch_state["active"] += 1
@@ -383,6 +393,50 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertGreaterEqual(fetch_state["max_active"], 2)
         self.assertTrue(all(position["price_source"] == "realtime_quote" for position in positions))
         self.assertTrue(all(position["price_provider"] == "unit-test" for position in positions))
+
+    def test_current_snapshot_reuses_bulk_prefetched_quotes(self) -> None:
+        today = date.today()
+        account = self.service.create_account(name="US", broker="Demo", market="us", base_currency="USD")
+        aid = account["id"]
+        symbols = ["AMZN", "GOOGL", "MSFT", "NFLX", "NVDA", "ORCL"]
+        for symbol in symbols:
+            self.service.record_trade(
+                account_id=aid,
+                symbol=symbol,
+                trade_date=today,
+                side="buy",
+                quantity=1,
+                price=100,
+                market="us",
+                currency="USD",
+            )
+
+        manager_instances: list[object] = []
+        prefetch_calls: list[list[str]] = []
+
+        class FakeDataFetcherManager:
+            def __init__(self) -> None:
+                manager_instances.append(self)
+
+            def prefetch_realtime_quotes(self, stock_codes: list[str]) -> int:
+                prefetch_calls.append(list(stock_codes))
+                return len(stock_codes)
+
+            def get_prefetched_realtime_quote(self, symbol: str) -> SimpleNamespace:
+                return SimpleNamespace(price=125.0, source="longbridge")
+
+            def get_realtime_quote(self, *args, **kwargs) -> None:
+                raise AssertionError("bulk cache hits must not issue per-symbol live requests")
+
+        with patch("data_provider.base.DataFetcherManager", new=FakeDataFetcherManager):
+            snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today, cost_method="fifo")
+
+        positions = snapshot["accounts"][0]["positions"]
+        self.assertEqual(len(prefetch_calls), 1)
+        self.assertEqual(set(prefetch_calls[0]), set(symbols))
+        self.assertEqual(len(manager_instances), 1)
+        self.assertTrue(all(position["last_price"] == 125.0 for position in positions))
+        self.assertTrue(all(position["price_provider"] == "longbridge" for position in positions))
 
     def test_historical_snapshot_marks_missing_price_without_cost_fallback(self) -> None:
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")

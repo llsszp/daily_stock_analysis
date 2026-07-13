@@ -1191,28 +1191,38 @@ class PortfolioService:
         if not unique_symbols:
             return {}
 
-        # Bulk prefetch (when applicable) only warms the fetcher-module-level realtime cache;
-        # the manager itself is discarded so per-symbol workers cannot serialize through its
-        # per-fetcher call locks when individual reads still need a live fetch (e.g. mixed
-        # markets, cache miss, or bulk source returning fewer rows than requested).
+        results: Dict[str, Tuple[Optional[float], Optional[str]]] = {}
+
+        # Reuse successful batch-prefetch results immediately. Cache misses still use
+        # independent managers below so their live requests remain concurrent.
         if len(unique_symbols) >= 5:
             try:
                 from data_provider.base import DataFetcherManager
 
-                DataFetcherManager().prefetch_realtime_quotes(unique_symbols)
+                prefetch_manager = DataFetcherManager()
+                prefetch_manager.prefetch_realtime_quotes(unique_symbols)
+                cache_reader = getattr(prefetch_manager, "get_prefetched_realtime_quote", None)
+                if callable(cache_reader):
+                    for symbol in unique_symbols:
+                        cached = self._position_price_from_quote(cache_reader(symbol))
+                        if cached[0] is not None:
+                            results[symbol] = cached
             except Exception as exc:
                 logger.warning("Failed to prefetch realtime portfolio quotes: %s", exc)
 
-        if len(unique_symbols) == 1:
-            symbol = unique_symbols[0]
-            return {symbol: self._fetch_realtime_position_price(symbol)}
+        missing_symbols = [symbol for symbol in unique_symbols if symbol not in results]
+        if not missing_symbols:
+            return results
+        if len(missing_symbols) == 1:
+            symbol = missing_symbols[0]
+            results[symbol] = self._fetch_realtime_position_price(symbol)
+            return results
 
-        results: Dict[str, Tuple[Optional[float], Optional[str]]] = {}
-        max_workers = min(PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS, len(unique_symbols))
+        max_workers = min(PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS, len(missing_symbols))
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="portfolio-quote") as executor:
             futures = {
                 executor.submit(self._fetch_realtime_position_price, symbol): symbol
-                for symbol in unique_symbols
+                for symbol in missing_symbols
             }
             for future in as_completed(futures):
                 symbol = futures[future]
@@ -1230,11 +1240,19 @@ class PortfolioService:
             from data_provider.base import DataFetcherManager
 
             fetcher_manager = DataFetcherManager()
-            quote = fetcher_manager.get_realtime_quote(symbol, log_final_failure=False)
+            quote = fetcher_manager.get_realtime_quote(
+                symbol,
+                log_final_failure=False,
+                supplement=False,
+            )
         except Exception as exc:
             logger.warning("Failed to fetch realtime portfolio price for %s: %s", symbol, exc)
             return None, None
 
+        return PortfolioService._position_price_from_quote(quote)
+
+    @staticmethod
+    def _position_price_from_quote(quote: Any) -> Tuple[Optional[float], Optional[str]]:
         if quote is None:
             return None, None
 

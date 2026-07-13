@@ -862,7 +862,7 @@ class LongbridgeFetcher(BaseFetcher):
     # static_info with cache
     # ------------------------------------------------------------------
 
-    def _get_static_info(self, symbol: str) -> Optional[Any]:
+    def _get_static_info(self, symbol: str, *, cache_only: bool = False) -> Optional[Any]:
         """Fetch static info (shares, EPS, BPS, name) with optional in-process TTL cache."""
         ttl = _static_info_ttl_seconds()
         now = time.time()
@@ -871,6 +871,9 @@ class LongbridgeFetcher(BaseFetcher):
                 cached = self._static_cache.get(symbol)
                 if cached and (now - cached[1]) < ttl:
                     return cached[0]
+
+        if cache_only:
+            return None
 
         ctx = self._get_ctx()
         if ctx is None:
@@ -1038,6 +1041,7 @@ class LongbridgeFetcher(BaseFetcher):
         stock_code: str,
         *,
         include_volume_ratio: bool = True,
+        cache_only: bool = False,
     ) -> Optional[UnifiedRealtimeQuote]:
         """Fetch realtime quote from Longbridge, computing derived fields."""
         if not self.is_available_for_request("realtime_quote"):
@@ -1048,12 +1052,13 @@ class LongbridgeFetcher(BaseFetcher):
             logger.debug(f"[Longbridge] 无法转换代码: {stock_code}")
             return None
 
-        ctx = self._get_ctx()
-        if ctx is None:
-            return None
-
         q = self._get_cached_quote(symbol)
         if q is None:
+            if cache_only:
+                return None
+            ctx = self._get_ctx()
+            if ctx is None:
+                return None
             try:
                 quotes = ctx.quote([symbol])
                 if not quotes:
@@ -1095,7 +1100,7 @@ class LongbridgeFetcher(BaseFetcher):
                 amplitude = round((high - low) / prev_close * 100, 2)
 
         # Fetch static info for derived fields
-        static = self._get_static_info(symbol)
+        static = self._get_static_info(symbol, cache_only=cache_only)
 
         turnover_rate = None
         pe_ratio = None
