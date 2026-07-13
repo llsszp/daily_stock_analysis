@@ -1891,7 +1891,7 @@ const StockScreeningPage: React.FC = () => {
                                 正在 AI 跑分
                               </span>
                             ) : item.llmStatus === 'failed' ? (
-                              <span className="text-danger" title={item.llmError || 'AI 评分失败'}>AI 失败</span>
+                              <span className="text-danger">AI 失败</span>
                             ) : (
                               <span>等待 AI</span>
                             )
