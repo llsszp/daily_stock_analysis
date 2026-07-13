@@ -17,7 +17,7 @@ import threading
 import time
 from contextvars import ContextVar
 from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -2059,8 +2059,7 @@ def _score_dsa_screen_candidates_with_ai(
     try:
         from src.analyzer import GeminiAnalyzer
 
-        scoring_config = _dsa_ai_scoring_config(config)
-        analyzer = GeminiAnalyzer(config=scoring_config)
+        analyzer = GeminiAnalyzer(config=config)
     except Exception as exc:
         error = redact_diagnostic_text(str(exc), limit=160) or "AI评分器初始化失败"
         for item in items:
@@ -2084,7 +2083,7 @@ def _score_dsa_screen_candidates_with_ai(
                 candidate=candidate,
                 strategy=strategy,
                 market=market,
-                config=scoring_config,
+                config=config,
             )
             items[index].update({"status": "completed", **scored})
             completed_count += 1
@@ -2206,29 +2205,6 @@ def _build_dsa_candidate_ai_score_context(
         "recent_24h": intraday_summary,
         "news": compact_news,
     })
-
-
-def _dsa_ai_scoring_config(config: Config) -> Config:
-    configured_models = get_configured_llm_models(config.llm_model_list or [])
-    preferred_model = next(
-        (
-            model
-            for model in configured_models
-            if "flash" in model.lower() or "mini" in model.lower()
-        ),
-        _env_text(config.litellm_model),
-    )
-    if not preferred_model or preferred_model == _env_text(config.litellm_model):
-        return config
-    fallbacks = _dedupe_strings([
-        _env_text(config.litellm_model),
-        *(config.litellm_fallback_models or []),
-    ])
-    return replace(
-        config,
-        litellm_model=preferred_model,
-        litellm_fallback_models=[model for model in fallbacks if model and model != preferred_model],
-    )
 
 
 def _parse_dsa_candidate_ai_score_response(text: str) -> Dict[str, Any]:

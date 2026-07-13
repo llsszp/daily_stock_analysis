@@ -581,6 +581,7 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
 
     def test_ai_scores_us_candidates_sequentially_and_publishes_partial_results(self) -> None:
         config = self._config(enabled=True)
+        config.litellm_model = "openai/glm-5.2"
         fake_analyzer = MagicMock()
         fake_analyzer.generate_text.side_effect = [
             json.dumps({
@@ -612,7 +613,7 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
             {"rank": 2, "code": "JNJ", "name": "强生", "score": 84, "reason": "量化第二", "raw": {}},
         ]
 
-        with patch("src.analyzer.GeminiAnalyzer", return_value=fake_analyzer):
+        with patch("src.analyzer.GeminiAnalyzer", return_value=fake_analyzer) as analyzer_class:
             result = alphasift_service._score_dsa_screen_candidates_with_ai(
                 candidates=candidates,
                 strategy="dsa_us_short_swing_recovery",
@@ -626,6 +627,7 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
                 }),
             )
 
+        analyzer_class.assert_called_once_with(config=config)
         self.assertEqual(fake_analyzer.generate_text.call_count, 2)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["completed_count"], 2)
@@ -638,25 +640,6 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
             and update["payload"]["items"][1]["status"] == "running"
             for update in updates
         ))
-
-    def test_ai_scoring_prefers_configured_low_latency_model(self) -> None:
-        config = self._config(enabled=True)
-        config.litellm_model = "openai/glm-5.2"
-        config.litellm_fallback_models = ["deepseek/deepseek-v4-pro"]
-        config.llm_model_list = [
-            {"model_name": "deepseek/deepseek-v4-flash", "litellm_params": {"model": "deepseek/deepseek-v4-flash"}},
-            {"model_name": "deepseek/deepseek-v4-pro", "litellm_params": {"model": "deepseek/deepseek-v4-pro"}},
-            {"model_name": "openai/glm-5.2", "litellm_params": {"model": "openai/glm-5.2"}},
-        ]
-
-        scoring_config = alphasift_service._dsa_ai_scoring_config(config)
-
-        self.assertEqual(scoring_config.litellm_model, "deepseek/deepseek-v4-flash")
-        self.assertEqual(
-            scoring_config.litellm_fallback_models,
-            ["openai/glm-5.2", "deepseek/deepseek-v4-pro"],
-        )
-        self.assertEqual(config.litellm_model, "openai/glm-5.2")
 
     def test_short_swing_extended_session_cap_changes_continuously(self) -> None:
         def score(change_pct: float) -> Dict[str, float]:
