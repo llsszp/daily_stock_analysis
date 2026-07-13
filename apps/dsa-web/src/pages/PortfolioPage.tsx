@@ -1292,7 +1292,7 @@ const PortfolioPage: React.FC = () => {
         </Card>
       </section>
 
-      <section className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,4fr)_minmax(220px,1fr)]">
+      <section className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_220px]">
         <Card padding="md">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-semibold text-foreground">{text.positionsTitle}</h2>
