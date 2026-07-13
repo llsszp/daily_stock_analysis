@@ -198,6 +198,7 @@ _DSA_US_DAILY_HISTORY_CACHE_LOCK = threading.RLock()
 _DSA_US_DAILY_HISTORY_CACHE: Dict[str, Tuple[float, Any, str]] = {}
 _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK = threading.RLock()
 _DSA_US_NASDAQ_UNIVERSE_CACHE: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+_DSA_US_NASDAQ_UNIVERSE_WARNING = ""
 _ALPHASIFT_LITELLM_COMPLETION_ROUTES: ContextVar[Optional[Tuple[Dict[str, Any], ...]]] = ContextVar(
     "alphasift_litellm_completion_routes",
     default=None,
@@ -1953,11 +1954,14 @@ def _screen_dsa_us(*, strategy: str, config: Config, max_results: int) -> Dict[s
     source_errors = [*(universe_meta.get("source_errors") or []), *source_errors]
     snapshot_count = int(_safe_float(universe_meta.get("snapshot_count")) or len(universe))
     prefilter_count = int(_safe_float(universe_meta.get("prefilter_count")) or len(universe))
+    realtime_prefilter_count = min(len(universe), _dsa_us_realtime_prefilter_limit(strategy))
+    deep_score_limit = min(realtime_prefilter_count, _dsa_us_daily_calibration_candidate_max(strategy))
     if not candidates:
-        warnings.append("DSA US realtime screen returned no candidates with usable prices.")
-    if len(universe) > len(candidates):
+        warnings.append("美股实时筛选未找到价格数据可用的候选股票。")
+    if deep_score_limit > len(candidates):
         warnings.append(
-            f"DSA US screen fully scored {len(candidates)} of {len(universe)} prefiltered symbols after realtime pre-rank."
+            f"实时预筛后，深度评分计划处理 {deep_score_limit} 只，实际完成 {len(candidates)} 只；"
+            "其余股票因实时行情或历史日线不足未进入最终评分。"
         )
     payload = {
         "enabled": True,
@@ -1973,11 +1977,8 @@ def _screen_dsa_us(*, strategy: str, config: Config, max_results: int) -> Dict[s
         "universe_eligible_count": universe_meta.get("eligible_count"),
         "universe_limit": universe_meta.get("limit"),
         "universe_basket_counts": universe_meta.get("basket_counts") or {},
-        "realtime_prefilter_count": min(len(universe), _dsa_us_realtime_prefilter_limit(strategy)),
-        "deep_score_limit": min(
-            min(len(universe), _dsa_us_realtime_prefilter_limit(strategy)),
-            _dsa_us_daily_calibration_candidate_max(strategy),
-        ),
+        "realtime_prefilter_count": realtime_prefilter_count,
+        "deep_score_limit": deep_score_limit,
         "after_filter_count": len(candidates),
         "ai_used": False,
         "ranking_method": "quantitative_rules",
@@ -2352,9 +2353,12 @@ def _build_dsa_us_dynamic_universe(*, strategy: str = "") -> Tuple[List[str], Di
         return [], {
             "snapshot_source": "dsa_us_universe",
             "universe_source": "configured_and_default",
-            "source_errors": [f"nasdaq_screener_universe_failed: {exc}"],
-            "warnings": ["Nasdaq screener universe unavailable; using configured/default US symbols only."],
+            "source_errors": [f"Nasdaq 全市场快照获取失败：{exc}"],
+            "warnings": ["Nasdaq 全市场快照获取失败，且本地没有可用缓存；本次已降级为配置及默认美股池。"],
         }
+
+    with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
+        universe_warning = _DSA_US_NASDAQ_UNIVERSE_WARNING
 
     raw_count = len(rows)
     eligible_rows: List[Dict[str, Any]] = []
@@ -2411,7 +2415,7 @@ def _build_dsa_us_dynamic_universe(*, strategy: str = "") -> Tuple[List[str], Di
         "basket_counts": basket_counts,
         "symbol_meta": symbol_meta,
         "source_errors": [],
-        "warnings": [],
+        "warnings": [universe_warning] if universe_warning else [],
     }
 
 
@@ -2531,7 +2535,7 @@ def _select_dsa_us_dynamic_universe_symbols(
 
 def _fetch_dsa_us_nasdaq_screener_rows() -> List[Dict[str, Any]]:
     now = time.time()
-    global _DSA_US_NASDAQ_UNIVERSE_CACHE
+    global _DSA_US_NASDAQ_UNIVERSE_CACHE, _DSA_US_NASDAQ_UNIVERSE_WARNING
     with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
         if (
             _DSA_US_NASDAQ_UNIVERSE_CACHE is not None
@@ -2543,6 +2547,7 @@ def _fetch_dsa_us_nasdaq_screener_rows() -> List[Dict[str, Any]]:
     if cached_rows:
         with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
             _DSA_US_NASDAQ_UNIVERSE_CACHE = (now, cached_rows)
+            _DSA_US_NASDAQ_UNIVERSE_WARNING = ""
         return [dict(row) for row in cached_rows]
 
     import requests
@@ -2572,17 +2577,26 @@ def _fetch_dsa_us_nasdaq_screener_rows() -> List[Dict[str, Any]]:
         )
         with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
             _DSA_US_NASDAQ_UNIVERSE_CACHE = (now, stale_rows)
+            _DSA_US_NASDAQ_UNIVERSE_WARNING = (
+                f"Nasdaq 全市场快照在线刷新失败，本次已使用本地缓存（{len(stale_rows)} 只）。"
+            )
         return [dict(row) for row in stale_rows]
     rows = ((payload.get("data") or {}).get("rows") or []) if isinstance(payload, dict) else []
     normalized_rows = [dict(row) for row in rows if isinstance(row, dict)]
     if not normalized_rows:
         stale_rows = _read_dsa_us_nasdaq_universe_cache(allow_stale=True)
         if stale_rows:
+            with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
+                _DSA_US_NASDAQ_UNIVERSE_CACHE = (now, stale_rows)
+                _DSA_US_NASDAQ_UNIVERSE_WARNING = (
+                    f"Nasdaq 全市场快照在线返回空数据，本次已使用本地缓存（{len(stale_rows)} 只）。"
+                )
             return [dict(row) for row in stale_rows]
         return []
     _write_dsa_us_nasdaq_universe_cache(normalized_rows)
     with _DSA_US_NASDAQ_UNIVERSE_CACHE_LOCK:
         _DSA_US_NASDAQ_UNIVERSE_CACHE = (now, normalized_rows)
+        _DSA_US_NASDAQ_UNIVERSE_WARNING = ""
     return [dict(row) for row in normalized_rows]
 
 
@@ -2808,8 +2822,9 @@ def _build_dsa_us_candidates(
         calibration = _build_dsa_us_analysis_calibration(code=code, quote=quote)
         if strategy == "dsa_us_short_swing_recovery" and not calibration.get("available"):
             source_errors.append(
-                f"{code}: daily_calibration_insufficient: "
-                f"{int(_safe_float(calibration.get('bar_count')) or 0)}/{DSA_US_DAILY_CALIBRATION_MIN_BARS} bars"
+                f"{code}：历史日线不足，仅获取 "
+                f"{int(_safe_float(calibration.get('bar_count')) or 0)}/{DSA_US_DAILY_CALIBRATION_MIN_BARS} 根，"
+                "已跳过深度评分"
             )
             continue
         candidates.append(

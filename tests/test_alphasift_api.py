@@ -501,6 +501,7 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
     def test_nasdaq_universe_uses_stale_cache_when_refresh_fails(self) -> None:
         stale_rows = [{"symbol": "AAPL", "name": "Apple Inc."}]
         alphasift_service._DSA_US_NASDAQ_UNIVERSE_CACHE = None
+        alphasift_service._DSA_US_NASDAQ_UNIVERSE_WARNING = ""
 
         with (
             patch(
@@ -512,7 +513,9 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
             rows = alphasift_service._fetch_dsa_us_nasdaq_screener_rows()
 
         self.assertEqual(rows, stale_rows)
+        self.assertIn("已使用本地缓存", alphasift_service._DSA_US_NASDAQ_UNIVERSE_WARNING)
         alphasift_service._DSA_US_NASDAQ_UNIVERSE_CACHE = None
+        alphasift_service._DSA_US_NASDAQ_UNIVERSE_WARNING = ""
 
     def test_us_universe_prioritizes_dynamic_rows_and_includes_liquid_etfs(self) -> None:
         config = self._config(enabled=True)
@@ -707,7 +710,7 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
             )
 
         self.assertEqual(candidates, [])
-        self.assertTrue(any("daily_calibration_insufficient" in error for error in errors))
+        self.assertTrue(any("历史日线不足" in error for error in errors))
 
     def test_recent_24h_scoring_penalizes_chasing_and_caps_rank(self) -> None:
         intraday = {
