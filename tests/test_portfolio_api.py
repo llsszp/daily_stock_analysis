@@ -224,6 +224,76 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(position["price_source"], "history_close")
         self.assertAlmostEqual(position["last_price"], 118.0, places=6)
 
+    def test_snapshot_prefer_cache_reuses_recent_background_realtime_value(self) -> None:
+        today = date.today()
+        account_id = self._create_position(symbol="AAPL", market="us", currency="USD")
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            return_value=(223.5, "LongbridgeFetcher"),
+        ):
+            live_resp = self.client.get(
+                "/api/v1/portfolio/snapshot",
+                params={"account_id": account_id, "as_of": today.isoformat(), "include_realtime": "true"},
+            )
+        self.assertEqual(live_resp.status_code, 200, live_resp.text)
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            side_effect=AssertionError("recent cache should avoid another realtime request"),
+        ):
+            cached_resp = self.client.get(
+                "/api/v1/portfolio/snapshot",
+                params={
+                    "account_id": account_id,
+                    "as_of": today.isoformat(),
+                    "include_realtime": "true",
+                    "prefer_cache": "true",
+                },
+            )
+        self.assertEqual(cached_resp.status_code, 200, cached_resp.text)
+        position = cached_resp.json()["accounts"][0]["positions"][0]
+        self.assertAlmostEqual(position["last_price"], 223.5, places=6)
+        self.assertEqual(position["price_source"], "realtime_quote")
+
+    def test_update_and_delete_current_position(self) -> None:
+        account_id = self._create_position(symbol="AAPL", market="us", currency="USD")
+        update_resp = self.client.put(
+            "/api/v1/portfolio/positions/AAPL",
+            json={
+                "account_id": account_id,
+                "quantity": 7,
+                "avg_cost": 145.25,
+                "market": "us",
+                "currency": "USD",
+            },
+        )
+        self.assertEqual(update_resp.status_code, 200, update_resp.text)
+        self.assertEqual(update_resp.json()["replaced_events"], 1)
+
+        trades_resp = self.client.get(
+            "/api/v1/portfolio/trades",
+            params={"account_id": account_id, "symbol": "AAPL"},
+        )
+        self.assertEqual(trades_resp.status_code, 200, trades_resp.text)
+        self.assertEqual(trades_resp.json()["total"], 1)
+        trade = trades_resp.json()["items"][0]
+        self.assertEqual(trade["quantity"], 7)
+        self.assertEqual(trade["price"], 145.25)
+        self.assertEqual(trade["note"], "持仓明细手动调整")
+
+        delete_resp = self.client.delete(
+            "/api/v1/portfolio/positions/AAPL",
+            params={"account_id": account_id},
+        )
+        self.assertEqual(delete_resp.status_code, 200, delete_resp.text)
+        self.assertEqual(delete_resp.json()["deleted"], 1)
+        after_resp = self.client.get(
+            "/api/v1/portfolio/trades",
+            params={"account_id": account_id, "symbol": "AAPL"},
+        )
+        self.assertEqual(after_resp.json()["total"], 0)
+
     def test_snapshot_exposes_partial_quality_fields_for_mixed_position_markets(self) -> None:
         create_resp = self.client.post(
             "/api/v1/portfolio/accounts",

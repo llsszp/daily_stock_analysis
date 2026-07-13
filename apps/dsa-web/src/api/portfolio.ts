@@ -17,6 +17,8 @@ import type {
   PortfolioImportCommitResponse,
   PortfolioImportParseResponse,
   PortfolioPositionAnalysisRequest,
+  PortfolioPositionUpdateRequest,
+  PortfolioPositionUpdateResponse,
   PortfolioRiskResponse,
   PortfolioSnapshotResponse,
   PortfolioTradeCreateRequest,
@@ -28,6 +30,7 @@ type SnapshotQuery = {
   asOf?: string;
   costMethod?: PortfolioCostMethod;
   includeRealtime?: boolean;
+  preferCache?: boolean;
 };
 
 type FxRefreshQuery = {
@@ -70,6 +73,9 @@ function buildSnapshotParams(query: SnapshotQuery): Record<string, string | numb
   }
   if (query.includeRealtime !== undefined) {
     params.include_realtime = query.includeRealtime ? 'true' : 'false';
+  }
+  if (query.preferCache !== undefined) {
+    params.prefer_cache = query.preferCache ? 'true' : 'false';
   }
   return params;
 }
@@ -146,6 +152,28 @@ export const portfolioApi = {
       },
     );
     return toCamelCase<TaskAccepted>(response.data);
+  },
+
+  async updatePosition(symbol: string, payload: PortfolioPositionUpdateRequest): Promise<PortfolioPositionUpdateResponse> {
+    const response = await apiClient.put<Record<string, unknown>>(
+      `/api/v1/portfolio/positions/${encodeURIComponent(symbol)}`,
+      {
+        account_id: payload.accountId,
+        quantity: payload.quantity,
+        avg_cost: payload.avgCost,
+        market: payload.market,
+        currency: payload.currency,
+      },
+    );
+    return toCamelCase<PortfolioPositionUpdateResponse>(response.data);
+  },
+
+  async deletePosition(symbol: string, accountId: number): Promise<PortfolioDeleteResponse> {
+    const response = await apiClient.delete<Record<string, unknown>>(
+      `/api/v1/portfolio/positions/${encodeURIComponent(symbol)}`,
+      { params: { account_id: accountId } },
+    );
+    return toCamelCase<PortfolioDeleteResponse>(response.data);
   },
 
   async getRisk(query: SnapshotQuery = {}): Promise<PortfolioRiskResponse> {

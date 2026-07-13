@@ -28,6 +28,8 @@ const {
   createAccount,
   deleteAccount,
   analyzePosition,
+  updatePosition,
+  deletePosition,
   listDecisionSignals,
   getLatestDecisionSignals,
   createAlertRule,
@@ -53,6 +55,8 @@ const {
   createAccount: vi.fn(),
   deleteAccount: vi.fn(),
   analyzePosition: vi.fn(),
+  updatePosition: vi.fn(),
+  deletePosition: vi.fn(),
   listDecisionSignals: vi.fn(),
   getLatestDecisionSignals: vi.fn(),
   createAlertRule: vi.fn(),
@@ -101,6 +105,8 @@ vi.mock('../../api/portfolio', () => ({
     createAccount,
     deleteAccount,
     analyzePosition,
+    updatePosition,
+    deletePosition,
   },
 }));
 
@@ -352,6 +358,8 @@ describe('PortfolioPage FX refresh', () => {
       message: '分析任务已加入队列: HK00700',
       analysisPhase: 'auto',
     });
+    updatePosition.mockResolvedValue({ id: 101, replacedEvents: 1 });
+    deletePosition.mockResolvedValue({ deleted: 1 });
     createAlertRule.mockResolvedValue({
       id: 88,
       name: '600519 跟踪止损',
@@ -382,8 +390,34 @@ describe('PortfolioPage FX refresh', () => {
 
     await waitForInitialLoad();
 
-    expect(getSnapshot).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
-    expect(getRisk).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
+    expect(getSnapshot).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true, preferCache: true });
+    expect(getRisk).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true, preferCache: true });
+  });
+
+  it('reloads the background-refreshed snapshot every minute while visible', async () => {
+    vi.useFakeTimers();
+    const view = render(<PortfolioPage />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const callsBeforeTimer = getSnapshot.mock.calls.length;
+
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(getSnapshot.mock.calls.length).toBeGreaterThan(callsBeforeTimer);
+    expect(getSnapshot).toHaveBeenLastCalledWith({
+      accountId: undefined,
+      costMethod: 'fifo',
+      includeRealtime: true,
+      preferCache: true,
+    });
+    view.unmount();
+    vi.useRealTimers();
   });
 
   it('defaults profitable positions to a trailing-stop alert at the current price', async () => {
@@ -418,6 +452,39 @@ describe('PortfolioPage FX refresh', () => {
 
     expect(await screen.findByText('已创建 2 条')).toBeInTheDocument();
     expect(listAlertRules).toHaveBeenCalledWith({ target: '600519', page: 1, pageSize: 1 });
+  });
+
+  it('edits a current position from the holdings row', async () => {
+    getSnapshot.mockResolvedValue(makeSnapshot({ positions: [makePosition()] }));
+    render(<PortfolioPage />);
+
+    await screen.findByText('600519');
+    fireEvent.click(screen.getByRole('button', { name: '编辑 600519 持仓' }));
+    fireEvent.change(screen.getByLabelText('持仓数量'), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText('平均成本'), { target: { value: '1550' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+
+    await waitFor(() => expect(updatePosition).toHaveBeenCalledWith('600519', {
+      accountId: 1,
+      quantity: 3,
+      avgCost: 1550,
+      market: 'cn',
+      currency: 'CNY',
+    }));
+    expect(await screen.findByText('600519 持仓已更新。')).toBeInTheDocument();
+  });
+
+  it('deletes a current position after explicit confirmation', async () => {
+    getSnapshot.mockResolvedValue(makeSnapshot({ positions: [makePosition()] }));
+    render(<PortfolioPage />);
+
+    await screen.findByText('600519');
+    fireEvent.click(screen.getByRole('button', { name: '删除 600519 持仓' }));
+    expect(screen.getByText(/交易和公司行为流水会一并删除/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => expect(deletePosition).toHaveBeenCalledWith('600519', 1));
+    expect(await screen.findByText('600519 持仓已删除。')).toBeInTheDocument();
   });
 
   it('defaults losing positions to an alert above the average cost', async () => {
@@ -571,7 +638,7 @@ describe('PortfolioPage FX refresh', () => {
     fireEvent.change(accountSelect, { target: { value: '1' } });
 
     await waitFor(() => {
-      expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 1, costMethod: 'fifo', includeRealtime: false });
+      expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 1, costMethod: 'fifo', includeRealtime: true, preferCache: true });
     });
 
     const snapshotCallsBeforeRefresh = getSnapshot.mock.calls.length;
@@ -708,8 +775,8 @@ describe('PortfolioPage FX refresh', () => {
 
     expect(await screen.findByText('新 AI 风险')).toBeInTheDocument();
     await waitFor(() => expect(getLatestDecisionSignals).toHaveBeenCalledTimes(2));
-    expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true });
-    expect(getRisk).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true });
+    expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true, preferCache: false });
+    expect(getRisk).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true, preferCache: false });
     expect(screen.queryByText('旧 AI 风险')).not.toBeInTheDocument();
   });
 
@@ -743,7 +810,7 @@ describe('PortfolioPage FX refresh', () => {
     fireEvent.change(accountSelect, { target: { value: '2' } });
 
     await waitFor(() => {
-      expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 2, costMethod: 'fifo', includeRealtime: false });
+      expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 2, costMethod: 'fifo', includeRealtime: true, preferCache: true });
     });
     expect(screen.queryByText('账号信号')).not.toBeInTheDocument();
     expect(getLatestDecisionSignals).toHaveBeenCalledTimes(signalCallsBeforeSwitch);
@@ -1095,13 +1162,13 @@ describe('PortfolioPage FX refresh', () => {
 
     const accountSelect = screen.getAllByRole('combobox')[0];
     fireEvent.change(accountSelect, { target: { value: '1' } });
-    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 1, costMethod: 'fifo', includeRealtime: false }));
+    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 1, costMethod: 'fifo', includeRealtime: true, preferCache: true }));
 
     fireEvent.click(screen.getByRole('button', { name: '刷新汇率' }));
     expect(await screen.findByRole('button', { name: '刷新中...' })).toBeDisabled();
 
     fireEvent.change(accountSelect, { target: { value: '2' } });
-    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 2, costMethod: 'fifo', includeRealtime: false }));
+    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 2, costMethod: 'fifo', includeRealtime: true, preferCache: true }));
     await waitFor(() => expect(screen.getByRole('button', { name: '刷新汇率' })).not.toBeDisabled());
 
     const snapshotCallsAfterSwitch = getSnapshot.mock.calls.length;
@@ -1145,7 +1212,7 @@ describe('PortfolioPage FX refresh', () => {
     expect(await screen.findByRole('button', { name: '刷新中...' })).toBeDisabled();
 
     fireEvent.change(costMethodSelect, { target: { value: 'avg' } });
-    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'avg', includeRealtime: false }));
+    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: undefined, costMethod: 'avg', includeRealtime: true, preferCache: true }));
     await waitFor(() => expect(screen.getByRole('button', { name: '刷新汇率' })).not.toBeDisabled());
 
     const snapshotCallsAfterSwitch = getSnapshot.mock.calls.length;
@@ -1180,7 +1247,7 @@ describe('PortfolioPage FX refresh', () => {
     const accountSelect = screen.getAllByRole('combobox')[0];
     fireEvent.change(accountSelect, { target: { value: '1' } });
 
-    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 1, costMethod: 'fifo', includeRealtime: false }));
+    await waitFor(() => expect(getSnapshot).toHaveBeenLastCalledWith({ accountId: 1, costMethod: 'fifo', includeRealtime: true, preferCache: true }));
     fireEvent.click(screen.getByRole('button', { name: '删除账户' }));
 
     const dialog = await screen.findByText('删除持仓账户');

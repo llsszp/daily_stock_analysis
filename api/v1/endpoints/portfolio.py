@@ -30,6 +30,8 @@ from api.v1.schemas.portfolio import (
     PortfolioImportParseResponse,
     PortfolioImportTradeItem,
     PortfolioPositionAnalysisRequest,
+    PortfolioPositionUpdateRequest,
+    PortfolioPositionUpdateResponse,
     PortfolioRiskResponse,
     PortfolioSnapshotResponse,
     PortfolioTradeListResponse,
@@ -425,6 +427,10 @@ def get_snapshot(
         True,
         description="Whether today's snapshot should try realtime quotes before historical close fallback",
     ),
+    prefer_cache: bool = Query(
+        False,
+        description="Use the recent background-refreshed snapshot before fetching quotes again",
+    ),
 ) -> PortfolioSnapshotResponse:
     service = PortfolioService()
     try:
@@ -433,12 +439,67 @@ def get_snapshot(
             as_of=as_of,
             cost_method=cost_method,
             include_realtime=include_realtime,
+            prefer_cache=prefer_cache,
         )
         return PortfolioSnapshotResponse(**data)
     except ValueError as exc:
         raise _bad_request(exc)
     except Exception as exc:
         raise _internal_error("Get snapshot failed", exc)
+
+
+@router.put(
+    "/positions/{symbol}",
+    response_model=PortfolioPositionUpdateResponse,
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Replace a current position with one consolidated holding event",
+)
+def update_position(symbol: str, request: PortfolioPositionUpdateRequest) -> PortfolioPositionUpdateResponse:
+    service = PortfolioService()
+    try:
+        result = service.replace_position(
+            account_id=request.account_id,
+            symbol=symbol,
+            quantity=request.quantity,
+            avg_cost=request.avg_cost,
+            market=request.market,
+            currency=request.currency,
+        )
+        return PortfolioPositionUpdateResponse(**result)
+    except LookupError as exc:
+        raise api_error(404, "not_found", str(exc))
+    except PortfolioBusyError as exc:
+        raise _conflict_error(error="portfolio_busy", message=str(exc))
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Update position failed", exc)
+
+
+@router.delete(
+    "/positions/{symbol}",
+    response_model=PortfolioDeleteResponse,
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Delete all ledger events for a current position",
+)
+def delete_position(
+    symbol: str,
+    account_id: int = Query(..., description="Portfolio account id"),
+) -> PortfolioDeleteResponse:
+    service = PortfolioService()
+    try:
+        deleted = service.delete_position(account_id=account_id, symbol=symbol)
+        if deleted <= 0:
+            raise api_error(404, "not_found", f"Position not found: {symbol}")
+        return PortfolioDeleteResponse(deleted=deleted)
+    except PortfolioBusyError as exc:
+        raise _conflict_error(error="portfolio_busy", message=str(exc))
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Delete position failed", exc)
 
 
 @router.post(
@@ -661,6 +722,10 @@ def get_risk_report(
         True,
         description="Whether today's risk snapshot should try realtime quotes before historical close fallback",
     ),
+    prefer_cache: bool = Query(
+        False,
+        description="Use the recent background-refreshed snapshot before fetching quotes again",
+    ),
 ) -> PortfolioRiskResponse:
     service = PortfolioRiskService()
     try:
@@ -669,6 +734,7 @@ def get_risk_report(
             as_of=as_of,
             cost_method=cost_method,
             include_realtime=include_realtime,
+            prefer_cache=prefer_cache,
         )
         return PortfolioRiskResponse(**data)
     except ValueError as exc:

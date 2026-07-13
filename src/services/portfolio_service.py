@@ -8,7 +8,7 @@ import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
@@ -109,8 +109,9 @@ class _ResolvedPositionPrice:
 class PortfolioService:
     """Business logic for account CRUD, event writes, and snapshot replay."""
 
-    def __init__(self, repo: Optional[PortfolioRepository] = None):
+    def __init__(self, repo: Optional[PortfolioRepository] = None, fetcher_manager: Any = None):
         self.repo = repo or PortfolioRepository()
+        self._fetcher_manager = fetcher_manager
 
     # ------------------------------------------------------------------
     # Account CRUD
@@ -330,6 +331,64 @@ class PortfolioService:
         with self.repo.portfolio_write_session() as session:
             return self.repo.delete_trade_in_session(session=session, trade_id=trade_id)
 
+    def replace_position(
+        self,
+        *,
+        account_id: int,
+        symbol: str,
+        quantity: float,
+        avg_cost: float,
+        market: Optional[str] = None,
+        currency: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if quantity <= 0 or avg_cost <= 0:
+            raise ValueError("quantity and avg_cost must be > 0")
+        symbol_norm = self._normalize_symbol_for_storage(symbol)
+        symbol_filters = self._build_symbol_filter_values(symbol)
+        if not symbol_norm or not symbol_filters:
+            raise ValueError("symbol is required")
+        with self.repo.portfolio_write_session() as session:
+            account = self._require_active_account_in_session(session=session, account_id=account_id)
+            market_norm = self._normalize_market(market or account.market)
+            currency_norm = self._normalize_currency(currency or self._default_currency_for_market(market_norm))
+            replaced_events, first_date = self.repo.delete_position_events_in_session(
+                session=session,
+                account_id=account_id,
+                symbols=symbol_filters,
+            )
+            if replaced_events <= 0:
+                raise LookupError(f"Position not found: {symbol_norm}")
+            row = self.repo.add_trade_in_session(
+                session=session,
+                account_id=account_id,
+                trade_uid=None,
+                symbol=symbol_norm,
+                market=market_norm,
+                currency=currency_norm,
+                trade_date=first_date or date.today(),
+                side="buy",
+                quantity=float(quantity),
+                price=float(avg_cost),
+                fee=0.0,
+                tax=0.0,
+                note="持仓明细手动调整",
+                dedup_hash=None,
+            )
+            return {"id": int(row.id), "replaced_events": replaced_events}
+
+    def delete_position(self, *, account_id: int, symbol: str) -> int:
+        symbol_filters = self._build_symbol_filter_values(symbol)
+        if not symbol_filters:
+            raise ValueError("symbol is required")
+        with self.repo.portfolio_write_session() as session:
+            self._require_active_account_in_session(session=session, account_id=account_id)
+            deleted, _ = self.repo.delete_position_events_in_session(
+                session=session,
+                account_id=account_id,
+                symbols=symbol_filters,
+            )
+            return deleted
+
     def delete_cash_ledger_event(self, entry_id: int) -> bool:
         with self.repo.portfolio_write_session() as session:
             return self.repo.delete_cash_ledger_in_session(session=session, entry_id=entry_id)
@@ -475,6 +534,8 @@ class PortfolioService:
         as_of: Optional[date] = None,
         cost_method: str = "fifo",
         include_realtime: bool = True,
+        prefer_cache: bool = False,
+        cache_max_age_seconds: int = 150,
     ) -> Dict[str, Any]:
         as_of_date = as_of or date.today()
         method = self._normalize_cost_method(cost_method)
@@ -484,6 +545,17 @@ class PortfolioService:
             account_rows = [account]
         else:
             account_rows = self.repo.list_accounts(include_inactive=False)
+
+        if prefer_cache:
+            cached = self._get_cached_portfolio_snapshot(
+                account_rows=account_rows,
+                account_id=account_id,
+                as_of_date=as_of_date,
+                cost_method=method,
+                max_age_seconds=cache_max_age_seconds,
+            )
+            if cached is not None:
+                return cached
 
         accounts_payload: List[Dict[str, Any]] = []
         aggregate_currency = "CNY"
@@ -610,6 +682,95 @@ class PortfolioService:
             "data_quality": "partial" if aggregate["limitations"] else "ok",
             "limitations": aggregate["limitations"],
             "accounts": accounts_payload,
+        }
+
+    def _get_cached_portfolio_snapshot(
+        self,
+        *,
+        account_rows: List[Any],
+        account_id: Optional[int],
+        as_of_date: date,
+        cost_method: str,
+        max_age_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        rows = self.repo.list_daily_snapshots(
+            snapshot_date=as_of_date,
+            cost_method=cost_method,
+            account_id=account_id,
+        )
+        if len(rows) != len(account_rows):
+            return None
+
+        now = datetime.now()
+        account_by_id = {int(account.id): account for account in account_rows}
+        payloads: List[Dict[str, Any]] = []
+        for row in rows:
+            if row.updated_at is None or (now - row.updated_at).total_seconds() > max(1, int(max_age_seconds)):
+                return None
+            if int(row.account_id) not in account_by_id:
+                return None
+            try:
+                payload = json.loads(row.payload or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, dict):
+                return None
+            payloads.append(payload)
+
+        aggregate_currency = "CNY"
+        aggregate = {
+            "total_cash": 0.0,
+            "total_market_value": 0.0,
+            "total_equity": 0.0,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "fee_total": 0.0,
+            "tax_total": 0.0,
+            "fx_stale": False,
+            "limitations": [],
+        }
+        amount_fields = (
+            "total_cash",
+            "total_market_value",
+            "total_equity",
+            "realized_pnl",
+            "unrealized_pnl",
+            "fee_total",
+            "tax_total",
+        )
+        for payload in payloads:
+            account = account_by_id[int(payload.get("account_id") or 0)]
+            aggregate["limitations"] = _merge_portfolio_limitations(
+                aggregate["limitations"], payload.get("limitations", []),
+            )
+            stale_values = []
+            for field in amount_fields:
+                converted, stale, _ = self._convert_amount(
+                    amount=float(payload.get(field) or 0.0),
+                    from_currency=account.base_currency,
+                    to_currency=aggregate_currency,
+                    as_of_date=as_of_date,
+                )
+                aggregate[field] += converted
+                stale_values.append(stale)
+            aggregate["fx_stale"] = aggregate["fx_stale"] or any(stale_values)
+
+        return {
+            "as_of": as_of_date.isoformat(),
+            "cost_method": cost_method,
+            "currency": aggregate_currency,
+            "account_count": len(account_rows),
+            "total_cash": round(aggregate["total_cash"], 6),
+            "total_market_value": round(aggregate["total_market_value"], 6),
+            "total_equity": round(aggregate["total_equity"], 6),
+            "realized_pnl": round(aggregate["realized_pnl"], 6),
+            "unrealized_pnl": round(aggregate["unrealized_pnl"], 6),
+            "fee_total": round(aggregate["fee_total"], 6),
+            "tax_total": round(aggregate["tax_total"], 6),
+            "fx_stale": aggregate["fx_stale"],
+            "data_quality": "partial" if aggregate["limitations"] else "ok",
+            "limitations": aggregate["limitations"],
+            "accounts": payloads,
         }
 
     def refresh_fx_rates(
@@ -1192,18 +1353,28 @@ class PortfolioService:
             return {}
 
         results: Dict[str, Tuple[Optional[float], Optional[str]]] = {}
+        manager = self._fetcher_manager
+
+        if manager is not None:
+            cache_reader = getattr(manager, "get_prefetched_realtime_quote", None)
+            if callable(cache_reader):
+                for symbol in unique_symbols:
+                    cached = self._position_price_from_quote(cache_reader(symbol))
+                    if cached[0] is not None:
+                        results[symbol] = cached
 
         # Reuse successful batch-prefetch results immediately. Cache misses still use
         # independent managers below so their live requests remain concurrent.
-        if len(unique_symbols) >= 5:
+        missing_before_prefetch = [symbol for symbol in unique_symbols if symbol not in results]
+        if len(missing_before_prefetch) >= 5:
             try:
                 from data_provider.base import DataFetcherManager
 
-                prefetch_manager = DataFetcherManager()
-                prefetch_manager.prefetch_realtime_quotes(unique_symbols)
+                prefetch_manager = manager or DataFetcherManager()
+                prefetch_manager.prefetch_realtime_quotes(missing_before_prefetch)
                 cache_reader = getattr(prefetch_manager, "get_prefetched_realtime_quote", None)
                 if callable(cache_reader):
-                    for symbol in unique_symbols:
+                    for symbol in missing_before_prefetch:
                         cached = self._position_price_from_quote(cache_reader(symbol))
                         if cached[0] is not None:
                             results[symbol] = cached
@@ -1234,12 +1405,11 @@ class PortfolioService:
 
         return results
 
-    @staticmethod
-    def _fetch_realtime_position_price(symbol: str) -> Tuple[Optional[float], Optional[str]]:
+    def _fetch_realtime_position_price(self, symbol: str) -> Tuple[Optional[float], Optional[str]]:
         try:
             from data_provider.base import DataFetcherManager
 
-            fetcher_manager = DataFetcherManager()
+            fetcher_manager = self._fetcher_manager or DataFetcherManager()
             quote = fetcher_manager.get_realtime_quote(
                 symbol,
                 log_final_failure=False,

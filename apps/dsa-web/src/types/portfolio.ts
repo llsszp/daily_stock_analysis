@@ -56,6 +56,19 @@ export interface PortfolioPositionAnalysisRequest {
   force?: boolean;
 }
 
+export interface PortfolioPositionUpdateRequest {
+  accountId: number;
+  quantity: number;
+  avgCost: number;
+  market?: 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw';
+  currency?: string;
+}
+
+export interface PortfolioPositionUpdateResponse {
+  id: number;
+  replacedEvents: number;
+}
+
 export interface PortfolioAccountSnapshot {
   accountId: number;
   accountName: string;

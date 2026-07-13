@@ -43,6 +43,7 @@ class PortfolioRiskService:
         as_of: Optional[date] = None,
         cost_method: str = "fifo",
         include_realtime: bool = True,
+        prefer_cache: bool = False,
     ) -> Dict[str, Any]:
         as_of_date = as_of or date.today()
         snapshot = self.portfolio_service.get_portfolio_snapshot(
@@ -50,6 +51,7 @@ class PortfolioRiskService:
             as_of=as_of_date,
             cost_method=cost_method,
             include_realtime=include_realtime,
+            prefer_cache=prefer_cache,
         )
 
         thresholds = {

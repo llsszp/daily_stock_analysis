@@ -1,15 +1,16 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BellPlus } from 'lucide-react';
+import { BellPlus, Pencil, Trash2 } from 'lucide-react';
 import { Pie, PieChart, ResponsiveContainer, Tooltip, Legend, Cell } from 'recharts';
 import { decisionSignalsApi } from '../api/decisionSignals';
 import { alertsApi } from '../api/alerts';
 import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
-import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
+import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert, Tooltip as UiTooltip } from '../components/common';
 import { PortfolioSignalSummary } from '../components/decision-signals/DecisionSignalDisplay';
 import { PositionAlertDialog } from '../components/portfolio/PositionAlertDialog';
+import { PositionEditDialog } from '../components/portfolio/PositionEditDialog';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText } from '../i18n/uiText';
 import { PORTFOLIO_TEXT } from '../locales/featureText';
@@ -109,6 +110,10 @@ type PendingDelete =
 type PendingAccountDelete = {
   accountId: number;
   accountName: string;
+};
+
+type PendingPositionDelete = {
+  position: FlatPosition;
 };
 
 type FxRefreshContext = {
@@ -222,6 +227,10 @@ const PortfolioPage: React.FC = () => {
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
   const [alertPosition, setAlertPosition] = useState<FlatPosition | null>(null);
+  const [editPosition, setEditPosition] = useState<FlatPosition | null>(null);
+  const [pendingPositionDelete, setPendingPositionDelete] = useState<PendingPositionDelete | null>(null);
+  const [positionMutationLoading, setPositionMutationLoading] = useState(false);
+  const [positionMutationMessage, setPositionMutationMessage] = useState<string | null>(null);
   const [alertCreateMessage, setAlertCreateMessage] = useState<string | null>(null);
   const [positionAlertCounts, setPositionAlertCounts] = useState<Record<string, number | null>>({});
   const positionAlertCountsRequestRef = useRef(0);
@@ -345,14 +354,15 @@ const PortfolioPage: React.FC = () => {
     }
   }, [selectedBroker]);
 
-  const loadSnapshotAndRisk = useCallback(async (includeRealtime = false) => {
+  const loadSnapshotAndRisk = useCallback(async (forceRealtime = false) => {
     setIsLoading(true);
     setRiskWarning(null);
     try {
       const snapshotData = await portfolioApi.getSnapshot({
         accountId: queryAccountId,
         costMethod,
-        includeRealtime,
+        includeRealtime: true,
+        preferCache: !forceRealtime,
       });
       setSnapshot(snapshotData);
       setError(null);
@@ -361,7 +371,8 @@ const PortfolioPage: React.FC = () => {
         const riskData = await portfolioApi.getRisk({
           accountId: queryAccountId,
           costMethod,
-          includeRealtime,
+          includeRealtime: true,
+          preferCache: !forceRealtime,
         });
         setRisk(riskData);
       } catch (riskErr) {
@@ -375,6 +386,21 @@ const PortfolioPage: React.FC = () => {
       setError(getParsedApiError(err));
     } finally {
       setIsLoading(false);
+    }
+  }, [queryAccountId, costMethod]);
+
+  const loadLatestCachedSnapshot = useCallback(async () => {
+    try {
+      const snapshotData = await portfolioApi.getSnapshot({
+        accountId: queryAccountId,
+        costMethod,
+        includeRealtime: true,
+        preferCache: true,
+      });
+      setSnapshot(snapshotData);
+      setError(null);
+    } catch (err) {
+      setError(getParsedApiError(err));
     }
   }, [queryAccountId, costMethod]);
 
@@ -449,6 +475,15 @@ const PortfolioPage: React.FC = () => {
   useEffect(() => {
     void loadSnapshotAndRisk();
   }, [loadSnapshotAndRisk]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadLatestCachedSnapshot();
+      }
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [loadLatestCachedSnapshot]);
 
   useEffect(() => {
     void loadEvents();
@@ -623,6 +658,33 @@ const PortfolioPage: React.FC = () => {
       setError(getParsedApiError(err));
     } finally {
       setPositionAnalysisLoadingKey(null);
+    }
+  };
+
+  const handlePositionSaved = async (symbol: string) => {
+    setEditPosition(null);
+    setPositionMutationMessage(
+      language === 'zh' ? `${symbol} 持仓已更新。` : `${symbol} position updated.`,
+    );
+    await refreshPortfolioData();
+  };
+
+  const handleConfirmPositionDelete = async () => {
+    if (!pendingPositionDelete || positionMutationLoading) return;
+    const { position } = pendingPositionDelete;
+    setPositionMutationLoading(true);
+    setError(null);
+    try {
+      await portfolioApi.deletePosition(position.symbol, position.accountId);
+      setPendingPositionDelete(null);
+      setPositionMutationMessage(
+        language === 'zh' ? `${position.symbol} 持仓已删除。` : `${position.symbol} position deleted.`,
+      );
+      await refreshPortfolioData();
+    } catch (err) {
+      setError(getParsedApiError(err));
+    } finally {
+      setPositionMutationLoading(false);
     }
   };
 
@@ -891,7 +953,8 @@ const PortfolioPage: React.FC = () => {
       const snapshotData = await portfolioApi.getSnapshot({
         accountId: requestedAccountId,
         costMethod: requestedCostMethod,
-        includeRealtime: false,
+        includeRealtime: true,
+        preferCache: true,
       });
       if (!isActiveRefreshContext(requestedViewKey, requestedRequestId)) {
         return false;
@@ -900,10 +963,11 @@ const PortfolioPage: React.FC = () => {
       setError(null);
 
       try {
-        const riskData = await portfolioApi.getRisk({
-          accountId: requestedAccountId,
-          costMethod: requestedCostMethod,
-          includeRealtime: false,
+      const riskData = await portfolioApi.getRisk({
+        accountId: requestedAccountId,
+        costMethod: requestedCostMethod,
+        includeRealtime: true,
+        preferCache: true,
         });
         if (!isActiveRefreshContext(requestedViewKey, requestedRequestId)) {
           return false;
@@ -1099,6 +1163,14 @@ const PortfolioPage: React.FC = () => {
           className="rounded-xl px-3 py-2 text-xs shadow-none"
         />
       ) : null}
+      {positionMutationMessage ? (
+        <InlineAlert
+          variant="success"
+          title={language === 'zh' ? '持仓已更新' : 'Position updated'}
+          message={positionMutationMessage}
+          className="rounded-xl px-3 py-2 text-xs shadow-none"
+        />
+      ) : null}
 
       {(showCreateAccount || !hasAccounts) ? (
         <Card padding="md">
@@ -1220,8 +1292,8 @@ const PortfolioPage: React.FC = () => {
         </Card>
       </section>
 
-      <section className="grid grid-cols-1 xl:grid-cols-3 gap-3">
-        <Card className="xl:col-span-2" padding="md">
+      <section className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,4fr)_minmax(220px,1fr)]">
+        <Card padding="md">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-semibold text-foreground">{text.positionsTitle}</h2>
             <span className="text-xs text-secondary">{formatUiText(text.countItems, { count: positionRows.length })}</span>
@@ -1242,7 +1314,7 @@ const PortfolioPage: React.FC = () => {
             />
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-[960px] w-full text-sm">
+              <table className="min-w-[1120px] w-full text-sm">
                 <thead className="text-xs text-secondary border-b border-white/10">
                   <tr>
                     <th className="text-left py-2 pr-2">{text.account}</th>
@@ -1255,7 +1327,7 @@ const PortfolioPage: React.FC = () => {
                     <th className="text-right py-2 pr-3">{text.returnPct}</th>
                     <th className="min-w-[9rem] text-right py-2 pr-3">{t('decisionSignals.portfolioColumn')}</th>
                     <th className="w-20 text-right py-2 pr-2">{language === 'zh' ? '告警' : 'Alert'}</th>
-                    <th className="w-20 text-right py-2">{text.action}</th>
+                    <th className="w-36 text-right py-2">{text.action}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1324,15 +1396,43 @@ const PortfolioPage: React.FC = () => {
                           {language === 'zh' ? '创建' : 'Create'}
                         </button>
                       </td>
-                      <td className="py-2 text-right">
-                        <button
-                          type="button"
-                          onClick={() => void handleAnalyzePosition(row)}
-                          disabled={analyzing}
-                          className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
-                        >
-                          {analyzing ? text.submitting : text.analyze}
-                        </button>
+                      <td className="py-2 text-right align-top">
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => void handleAnalyzePosition(row)}
+                            disabled={analyzing}
+                            className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
+                          >
+                            {analyzing ? text.submitting : text.analyze}
+                          </button>
+                          <UiTooltip content={language === 'zh' ? '编辑持仓' : 'Edit position'}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditPosition(row);
+                                setPositionMutationMessage(null);
+                              }}
+                              className="btn-secondary inline-flex h-7 w-7 items-center justify-center p-0"
+                              aria-label={language === 'zh' ? `编辑 ${row.symbol} 持仓` : `Edit ${row.symbol} position`}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                          </UiTooltip>
+                          <UiTooltip content={language === 'zh' ? '删除持仓' : 'Delete position'}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPendingPositionDelete({ position: row });
+                                setPositionMutationMessage(null);
+                              }}
+                              className="btn-secondary inline-flex h-7 w-7 items-center justify-center border-red-400/40 p-0 text-red-300 hover:bg-red-500/15"
+                              aria-label={language === 'zh' ? `删除 ${row.symbol} 持仓` : `Delete ${row.symbol} position`}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </UiTooltip>
+                        </div>
                       </td>
                     </tr>
                     );
@@ -1348,10 +1448,10 @@ const PortfolioPage: React.FC = () => {
             {concentrationMode === 'sector' ? text.sectorConcentration : text.positionConcentrationFallback}
           </h2>
           {concentrationPieData.length > 0 ? (
-            <div className="h-64">
+            <div className="h-56">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
-                  <Pie data={concentrationPieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={90}>
+                  <Pie data={concentrationPieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={72}>
                     {concentrationPieData.map((entry, index) => (
                       <Cell key={`cell-${entry.name}`} fill={PIE_COLORS[index % PIE_COLORS.length]} />
                     ))}
@@ -1742,6 +1842,31 @@ const PortfolioPage: React.FC = () => {
             setPendingAccountDelete(null);
           }
         }}
+      />
+      <ConfirmDialog
+        isOpen={Boolean(pendingPositionDelete)}
+        title={language === 'zh' ? '删除持仓' : 'Delete position'}
+        message={pendingPositionDelete
+          ? (
+              language === 'zh'
+                ? `确认删除 ${pendingPositionDelete.position.accountName} 中的 ${pendingPositionDelete.position.symbol} 持仓吗？该股票对应的交易和公司行为流水会一并删除，已创建的告警规则不会自动删除。`
+                : `Delete ${pendingPositionDelete.position.symbol} from ${pendingPositionDelete.position.accountName}? Its trade and corporate-action records will also be deleted. Existing alert rules will remain.`
+            )
+          : ''}
+        confirmText={positionMutationLoading
+          ? (language === 'zh' ? '删除中...' : 'Deleting...')
+          : (language === 'zh' ? '确认删除' : 'Delete')}
+        cancelText={language === 'zh' ? '取消' : 'Cancel'}
+        isDanger
+        onConfirm={() => void handleConfirmPositionDelete()}
+        onCancel={() => {
+          if (!positionMutationLoading) setPendingPositionDelete(null);
+        }}
+      />
+      <PositionEditDialog
+        position={editPosition}
+        onClose={() => setEditPosition(null)}
+        onSaved={(symbol) => void handlePositionSaved(symbol)}
       />
       <PositionAlertDialog
         position={alertPosition}

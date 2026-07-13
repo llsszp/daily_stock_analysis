@@ -176,6 +176,19 @@ class PortfolioPositionAnalysisRequest(BaseModel):
     force: bool = Field(False, description="Force refresh analysis inputs without bypassing duplicate in-flight tasks")
 
 
+class PortfolioPositionUpdateRequest(BaseModel):
+    account_id: int
+    quantity: float = Field(..., gt=0)
+    avg_cost: float = Field(..., gt=0)
+    market: Optional[Literal["cn", "hk", "us", "jp", "kr", "tw"]] = None
+    currency: Optional[str] = Field(None, min_length=3, max_length=8)
+
+
+class PortfolioPositionUpdateResponse(BaseModel):
+    id: int
+    replaced_events: int
+
+
 class PortfolioAccountSnapshot(BaseModel):
     account_id: int
     account_name: str

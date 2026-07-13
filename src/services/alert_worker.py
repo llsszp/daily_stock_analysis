@@ -39,6 +39,7 @@ from src.services.decision_signal_summary import (
 )
 from src.services.history_service import HistoryService
 from src.services.market_light_service import normalize_market_alert_region
+from src.services.portfolio_service import PortfolioService
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ class AlertWorker:
         *,
         config_provider: Optional[Callable[[], Any]] = None,
         service: Optional[AlertService] = None,
+        portfolio_service: Optional[PortfolioService] = None,
         decision_signal_service: Optional[DecisionSignalService] = None,
         notifier: Optional[Any] = None,
         now_provider: Optional[Callable[[], float]] = None,
@@ -90,6 +92,7 @@ class AlertWorker:
     ) -> None:
         self.config_provider = config_provider or self._default_config_provider
         self.service = service or AlertService()
+        self.portfolio_service = portfolio_service
         self.decision_signal_service = decision_signal_service or DecisionSignalService()
         self.notifier = notifier
         self.now_provider = now_provider or time.time
@@ -97,6 +100,7 @@ class AlertWorker:
         self._trigger_fingerprints: Dict[str, float] = {}
         self._trigger_fingerprint_ttls: Dict[str, int] = {}
         self._analysis_visibility_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._fetcher_manager: Any = None
 
     @staticmethod
     def _default_config_provider():
@@ -136,21 +140,48 @@ class AlertWorker:
         self._prune_fingerprints()
         runtime_rules = self._load_runtime_rules(config)
         stats["loaded"] = len(runtime_rules)
-        if not runtime_rules:
-            logger.info("[AlertWorker] No active alert rules loaded")
-            return stats
+        if self._fetcher_manager is None:
+            from data_provider.base import DataFetcherManager
 
-        monitor = EventMonitor()
-        realtime_symbols = sorted({
+            self._fetcher_manager = DataFetcherManager()
+        monitor = EventMonitor(fetcher_manager=self._fetcher_manager)
+        if self.portfolio_service is None:
+            self.portfolio_service = PortfolioService(fetcher_manager=self._fetcher_manager)
+        portfolio_service = self.portfolio_service
+        alert_symbols = {
             str(getattr(runtime_rule.rule, "stock_code", "") or "").strip()
             for runtime_rule in runtime_rules
             if str(getattr(runtime_rule.rule, "stock_code", "") or "").strip()
-        })
+        }
+        try:
+            portfolio_symbols = {
+                symbol
+                for _market, symbol in portfolio_service.repo.list_cached_position_identities()
+                if symbol
+            }
+        except Exception as exc:
+            logger.warning("[AlertWorker] Failed to load cached portfolio symbols: %s", exc)
+            portfolio_symbols = set()
+        realtime_symbols = sorted(alert_symbols | portfolio_symbols)
         if len(realtime_symbols) >= 5:
             try:
                 monitor.prefetch_realtime_quotes(realtime_symbols)
             except Exception as exc:
                 logger.warning("[AlertWorker] Failed to prefetch realtime quotes: %s", exc)
+        try:
+            snapshot = portfolio_service.get_portfolio_snapshot(include_realtime=True)
+            logger.info(
+                "[AlertWorker] Portfolio realtime cache refreshed: accounts=%s positions=%s",
+                snapshot.get("account_count", 0),
+                sum(len(account.get("positions") or []) for account in snapshot.get("accounts") or []),
+            )
+        except Exception as exc:
+            logger.warning("[AlertWorker] Failed to refresh portfolio realtime cache: %s", exc)
+
+        if not runtime_rules:
+            logger.info("[AlertWorker] No active alert rules loaded")
+            return stats
+
         daily_cache: Dict[Any, Any] = {}
         self._analysis_visibility_cache = {}
         for runtime_rule in runtime_rules:

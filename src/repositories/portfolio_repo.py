@@ -431,6 +431,49 @@ class PortfolioRepository:
         session.flush()
         return True
 
+    def delete_position_events_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+        symbols: List[str],
+    ) -> Tuple[int, Optional[date]]:
+        """Delete all trade and corporate-action events that build one position."""
+        symbol_values = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
+        if not symbol_values:
+            return 0, None
+        trades = session.execute(
+            select(PortfolioTrade).where(
+                and_(
+                    PortfolioTrade.account_id == account_id,
+                    PortfolioTrade.symbol.in_(symbol_values),
+                )
+            )
+        ).scalars().all()
+        actions = session.execute(
+            select(PortfolioCorporateAction).where(
+                and_(
+                    PortfolioCorporateAction.account_id == account_id,
+                    PortfolioCorporateAction.symbol.in_(symbol_values),
+                )
+            )
+        ).scalars().all()
+        event_dates = [row.trade_date for row in trades] + [row.effective_date for row in actions]
+        if not event_dates:
+            return 0, None
+        from_date = min(event_dates)
+        self._invalidate_account_cache_in_session(
+            session=session,
+            account_id=account_id,
+            from_date=from_date,
+        )
+        for row in trades:
+            session.delete(row)
+        for row in actions:
+            session.delete(row)
+        session.flush()
+        return len(trades) + len(actions), from_date
+
     def delete_cash_ledger_in_session(self, *, session: Any, entry_id: int) -> bool:
         row = session.execute(
             select(PortfolioCashLedger).where(PortfolioCashLedger.id == entry_id).limit(1)
@@ -859,6 +902,38 @@ class PortfolioRepository:
                     seen.add(identity)
                     identities.append(identity)
             return identities
+
+    def list_daily_snapshots(
+        self,
+        *,
+        snapshot_date: date,
+        cost_method: str,
+        account_id: Optional[int] = None,
+    ) -> List[PortfolioDailySnapshot]:
+        """Return exact-date cached snapshots for active accounts."""
+        with self.db.get_session() as session:
+            query = (
+                select(PortfolioDailySnapshot)
+                .join(
+                    PortfolioAccount,
+                    PortfolioAccount.id == PortfolioDailySnapshot.account_id,
+                )
+                .where(
+                    and_(
+                        PortfolioDailySnapshot.snapshot_date == snapshot_date,
+                        PortfolioDailySnapshot.cost_method == cost_method,
+                        PortfolioAccount.is_active.is_(True),
+                    )
+                )
+            )
+            if account_id is not None:
+                query = query.where(PortfolioDailySnapshot.account_id == account_id)
+            rows = session.execute(
+                query.order_by(PortfolioDailySnapshot.account_id.asc())
+            ).scalars().all()
+            for row in rows:
+                session.expunge(row)
+            return list(rows)
 
     # ------------------------------------------------------------------
     # Snapshot / position cache

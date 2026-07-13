@@ -717,13 +717,24 @@ class AlertWorkerTestCase(unittest.TestCase):
         self.assertEqual(self._triggers(), [])
 
     def test_empty_sources_are_a_noop(self) -> None:
-        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service)
+        portfolio_service = MagicMock()
+        portfolio_service.repo.list_cached_position_identities.return_value = [("us", "AAPL")]
+        portfolio_service.get_portfolio_snapshot.return_value = {
+            "account_count": 1,
+            "accounts": [{"positions": [{"symbol": "AAPL"}]}],
+        }
+        worker = AlertWorker(
+            config_provider=lambda: self._config(),
+            service=self.service,
+            portfolio_service=portfolio_service,
+        )
 
         stats = worker.run_once()
 
         self.assertEqual(stats["loaded"], 0)
         self.assertEqual(stats["evaluated"], 0)
         self.assertEqual(self._triggers(), [])
+        portfolio_service.get_portfolio_snapshot.assert_called_once_with(include_realtime=True)
 
     def test_missing_quote_writes_skipped_trigger_without_notification(self) -> None:
         self._create_rule(target="600519")
