@@ -3949,6 +3949,16 @@ class SearchService:
         )
         if any(token in text for token in rate_limit_tokens):
             return "rate_limited"
+        no_result_tokens = (
+            "hasn't returned any results",
+            "has not returned any results",
+            "no organic results",
+            "no search results",
+            "没有搜索结果",
+            "未找到搜索结果",
+        )
+        if any(token in text for token in no_result_tokens):
+            return "no_usable_results"
         return "failed"
     
     def search_stock_events(

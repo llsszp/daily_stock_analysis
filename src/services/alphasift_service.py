@@ -18,7 +18,7 @@ import time
 from contextvars import ContextVar
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -184,6 +184,7 @@ DSA_US_DAILY_CALIBRATION_CANDIDATE_MIN = 16
 DSA_US_DAILY_CALIBRATION_CANDIDATE_MAX = 24
 DSA_US_SHORT_SWING_DAILY_CALIBRATION_CANDIDATE_MAX = 32
 DSA_US_DAILY_HISTORY_CACHE_TTL_SECONDS = 15 * 60
+DSA_US_AKSHARE_DAILY_FETCH_RETRIES = 2
 DSA_US_NASDAQ_UNIVERSE_CACHE_TTL_SECONDS = 6 * 60 * 60
 DSA_US_UNIVERSE_PREFILTER_LIMIT = 80
 DSA_US_SHORT_SWING_UNIVERSE_PREFILTER_LIMIT = 220
@@ -2791,13 +2792,7 @@ def _build_dsa_us_candidates(
         quote_items.append((float(pre_scores.get("score") or 0.0), code, quote))
 
     quote_items.sort(key=lambda item: item[0], reverse=True)
-    calibration_limit = min(
-        len(quote_items),
-        max(
-            DSA_US_DAILY_CALIBRATION_CANDIDATE_MIN,
-            min(_dsa_us_daily_calibration_candidate_max(strategy), max(1, int(max_results or 20)) * 4),
-        ),
-    )
+    calibration_limit = _dsa_us_daily_calibration_limit(strategy, len(quote_items))
 
     candidates: List[Dict[str, Any]] = []
     for _pre_score, code, quote in quote_items[:calibration_limit]:
@@ -3025,6 +3020,11 @@ def _dsa_us_daily_calibration_candidate_max(strategy: str) -> int:
     return DSA_US_DAILY_CALIBRATION_CANDIDATE_MAX
 
 
+def _dsa_us_daily_calibration_limit(strategy: str, available_count: int) -> int:
+    """Keep the executed deep-score count aligned with the UI plan count."""
+    return min(max(0, int(available_count)), _dsa_us_daily_calibration_candidate_max(strategy))
+
+
 def _build_dsa_us_candidate(
     *,
     code: str,
@@ -3193,6 +3193,32 @@ def _load_dsa_us_daily_history_for_calibration(code: str) -> Tuple[Any, str, boo
                 cached_df, cached_source = cached[1], cached[2]
                 return cached_df.copy(), cached_source, True, ""
 
+    # AlphaSift evaluates dozens of different symbols in one run. Longbridge's
+    # historical-candlestick quota is based on unique symbols per calendar
+    # month, so it must not be the primary source for this broad calibration.
+    # Sina's unadjusted US daily feed keeps the latest price on the same basis
+    # as the realtime quote and does not consume that quota.
+    akshare_error = ""
+    try:
+        raw_df = _fetch_dsa_us_akshare_daily_history(
+            cache_key,
+            lookback_days=DSA_US_DAILY_CALIBRATION_LOOKBACK_DAYS,
+        )
+        normalized = _normalize_dsa_daily_history(raw_df)
+        if normalized is not None and not normalized.empty:
+            source_text = "AkshareSina"
+            if cache_key:
+                with _DSA_US_DAILY_HISTORY_CACHE_LOCK:
+                    _DSA_US_DAILY_HISTORY_CACHE[cache_key] = (
+                        now,
+                        normalized.copy(),
+                        source_text,
+                    )
+            return normalized, source_text, False, ""
+    except Exception as exc:  # noqa: BLE001 - manager fallback remains available.
+        akshare_error = str(exc)
+        logger.info("AlphaSift AkShare US daily fallback failed for %s: %s", cache_key, exc)
+
     try:
         manager = _get_dsa_fetcher_manager()
     except Exception as exc:  # noqa: BLE001
@@ -3205,7 +3231,10 @@ def _load_dsa_us_daily_history_for_calibration(code: str) -> Tuple[Any, str, boo
     try:
         raw_df, source = get_daily_data(code, days=DSA_US_DAILY_CALIBRATION_LOOKBACK_DAYS)
     except Exception as exc:  # noqa: BLE001
-        return None, "", False, f"daily_calibration_fetch_failed: {exc}"
+        details = f"daily_calibration_fetch_failed: {exc}"
+        if akshare_error:
+            details += f"; akshare_sina_failed: {akshare_error}"
+        return None, "", False, details
 
     normalized = _normalize_dsa_daily_history(raw_df)
     source_text = _env_text(source)
@@ -3213,6 +3242,39 @@ def _load_dsa_us_daily_history_for_calibration(code: str) -> Tuple[Any, str, boo
         with _DSA_US_DAILY_HISTORY_CACHE_LOCK:
             _DSA_US_DAILY_HISTORY_CACHE[cache_key] = (now, normalized.copy(), source_text)
     return normalized, source_text, False, ""
+
+
+def _fetch_dsa_us_akshare_daily_history(code: str, *, lookback_days: int) -> Any:
+    """Load recent unadjusted US daily bars from AkShare's Sina endpoint."""
+    import akshare as ak
+    import pandas as pd
+
+    symbol = _normalize_us_screen_symbol(code) or _env_text(code).upper()
+    if not symbol:
+        return pd.DataFrame()
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(lookback_days), 30))).date()
+    last_error: Optional[Exception] = None
+    for attempt in range(1, DSA_US_AKSHARE_DAILY_FETCH_RETRIES + 1):
+        try:
+            frame = ak.stock_us_daily(symbol=symbol, adjust="")
+            if frame is None or frame.empty:
+                return pd.DataFrame()
+            frame = pd.DataFrame(frame).copy()
+            if "date" not in frame.columns:
+                return pd.DataFrame()
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+            frame = frame.dropna(subset=["date"])
+            frame = frame[frame["date"].dt.date >= cutoff]
+            return frame.reset_index(drop=True)
+        except Exception as exc:  # noqa: BLE001 - bounded retry with manager fallback.
+            last_error = exc
+            if attempt < DSA_US_AKSHARE_DAILY_FETCH_RETRIES:
+                time.sleep(0.4 * attempt)
+
+    if last_error is not None:
+        raise last_error
+    return pd.DataFrame()
 
 
 def _calculate_dsa_us_daily_calibration(

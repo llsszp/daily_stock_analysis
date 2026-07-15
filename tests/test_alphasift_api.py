@@ -70,8 +70,14 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         Config.reset_instance()
         self.env_patch = patch.dict(os.environ, {"ALPHASIFT_DATA_DIR": ""}, clear=False)
         self.env_patch.start()
+        self.us_daily_patch = patch(
+            "src.services.alphasift_service._fetch_dsa_us_akshare_daily_history",
+            return_value=None,
+        )
+        self.us_daily_patch.start()
 
     def tearDown(self) -> None:
+        self.us_daily_patch.stop()
         self.env_patch.stop()
         Config.reset_instance()
 

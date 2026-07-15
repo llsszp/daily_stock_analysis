@@ -211,6 +211,12 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             SearchService._classify_news_provider_failure("connection reset"),
             "failed",
         )
+        self.assertEqual(
+            SearchService._classify_news_provider_failure(
+                "Google hasn't returned any results for this query."
+            ),
+            "no_usable_results",
+        )
 
     def test_search_stock_news_records_provider_diagnostics_for_fallback(self) -> None:
         """News search provider attempts should appear in run-flow diagnostics."""
