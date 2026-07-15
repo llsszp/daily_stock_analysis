@@ -81,6 +81,35 @@ _RUNTIME_ENV_FILE_KEYS = set()
 _PUBLIC_BIND_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
 
+def _raise_file_descriptor_limit(target: Optional[int] = None) -> Optional[Tuple[int, int]]:
+    """Raise an unusually low Unix file-descriptor soft limit for server mode."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - Windows
+        return None
+
+    if target is None:
+        try:
+            target = int(os.getenv("DSA_NOFILE_LIMIT", "4096"))
+        except (TypeError, ValueError):
+            target = 4096
+    if target <= 0:
+        return None
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft >= target:
+            return None
+        new_soft = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if new_soft <= soft:
+            return None
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+        return int(soft), int(new_soft)
+    except (OSError, ValueError) as exc:
+        logger.warning("提升文件描述符上限失败，将继续使用系统默认值: %s", exc)
+        return None
+
+
 def _get_active_env_path() -> Path:
     env_file = os.getenv("ENV_FILE")
     if env_file:
@@ -1255,6 +1284,14 @@ def main() -> int:
             stream=sys.stderr,
         )
         logger.warning("Bootstrap 日志初始化失败，已回退到 stderr: %s", exc)
+
+    descriptor_limit_change = _raise_file_descriptor_limit()
+    if descriptor_limit_change is not None:
+        logger.info(
+            "文件描述符软上限已从 %d 提升到 %d",
+            descriptor_limit_change[0],
+            descriptor_limit_change[1],
+        )
 
     # 加载配置（在 bootstrap logging 之后执行，确保异常有日志）
     try:

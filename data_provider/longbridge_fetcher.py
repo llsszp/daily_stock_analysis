@@ -662,6 +662,10 @@ class LongbridgeFetcher(BaseFetcher):
         self._ctx = None
         self._config = None
         self._ctx_lock = threading.Lock()
+        # Default DataFetcherManager instances share this fetcher.  The lock
+        # keeps SDK calls serialized even when they originate from different
+        # analysis pipelines or background workers.
+        self._manager_call_lock = threading.RLock()
         self._available = None
         self._cooldown_until = 0.0
         # {symbol: (StaticInfo, timestamp)}
@@ -1375,3 +1379,58 @@ class LongbridgeFetcher(BaseFetcher):
                 df[col] = None
 
         return df[STANDARD_COLUMNS]
+
+
+_SHARED_FETCHER_LOCK = threading.Lock()
+_SHARED_FETCHER: Optional[LongbridgeFetcher] = None
+_SHARED_FETCHER_FACTORY: Any = None
+_SHARED_FETCHER_CONFIG_FINGERPRINT: Optional[tuple] = None
+
+
+def _shared_fetcher_config_fingerprint(config: Any = None) -> tuple:
+    """Return an opaque runtime key so changed credentials rebuild the singleton."""
+    creds = _longbridge_credentials(config)
+    region = (
+        os.getenv("LONGBRIDGE_REGION")
+        or os.getenv("LONGPORT_REGION")
+        or ""
+    ).strip().lower()
+    return (
+        creds.get("app_key"),
+        creds.get("app_secret"),
+        creds.get("access_token"),
+        creds.get("oauth_client_id"),
+        region,
+    )
+
+
+def get_shared_longbridge_fetcher(config: Any = None) -> LongbridgeFetcher:
+    """Return the process-wide default fetcher to avoid leaking SDK contexts."""
+    global _SHARED_FETCHER
+    global _SHARED_FETCHER_FACTORY
+    global _SHARED_FETCHER_CONFIG_FINGERPRINT
+
+    factory = LongbridgeFetcher
+    fingerprint = _shared_fetcher_config_fingerprint(config)
+    with _SHARED_FETCHER_LOCK:
+        if (
+            _SHARED_FETCHER is None
+            or _SHARED_FETCHER_FACTORY is not factory
+            or _SHARED_FETCHER_CONFIG_FINGERPRINT != fingerprint
+        ):
+            _SHARED_FETCHER = factory()
+            _SHARED_FETCHER_FACTORY = factory
+            _SHARED_FETCHER_CONFIG_FINGERPRINT = fingerprint
+        return _SHARED_FETCHER
+
+
+def reset_shared_longbridge_fetcher() -> None:
+    """Clear the shared fetcher for tests and explicit runtime reconfiguration."""
+    global _SHARED_FETCHER
+    global _SHARED_FETCHER_FACTORY
+    global _SHARED_FETCHER_CONFIG_FINGERPRINT
+
+    with _SHARED_FETCHER_LOCK:
+        _SHARED_FETCHER = None
+        _SHARED_FETCHER_FACTORY = None
+        _SHARED_FETCHER_CONFIG_FINGERPRINT = None

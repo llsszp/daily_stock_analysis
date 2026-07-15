@@ -730,6 +730,9 @@ class DataFetcherManager:
 
     def _get_fetcher_call_lock(self, fetcher: BaseFetcher) -> RLock:
         self._ensure_concurrency_guards()
+        shared_lock = getattr(fetcher, "__dict__", {}).get("_manager_call_lock")
+        if shared_lock is not None:
+            return shared_lock
         fetcher_id = id(fetcher)
         with self._fetcher_call_locks_lock:
             lock = self._fetcher_call_locks.get(fetcher_id)
@@ -1160,7 +1163,7 @@ class DataFetcherManager:
         from .pytdx_fetcher import PytdxFetcher
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
-        from .longbridge_fetcher import LongbridgeFetcher
+        from .longbridge_fetcher import LongbridgeFetcher, get_shared_longbridge_fetcher
         config = get_config()
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
         efinance = EfinanceFetcher()
@@ -1192,7 +1195,10 @@ class DataFetcherManager:
             logger.debug("[data source init] skip TickFlowFetcher because TICKFLOW_API_KEY is not configured")
 
         if LongbridgeFetcher.has_configured_credentials(config):
-            optional_fetchers.append(LongbridgeFetcher())  # 长桥（美股/港股兜底，懒加载）
+            # QuoteContext has no public close API in the Python SDK. Reuse one
+            # process-wide fetcher so short-lived analysis pipelines do not
+            # accumulate sockets and kqueue descriptors.
+            optional_fetchers.append(get_shared_longbridge_fetcher(config))
         else:
             logger.debug("[数据源初始化] 跳过未配置的 LongbridgeFetcher")
 

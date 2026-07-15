@@ -189,8 +189,10 @@ class TestFetcherSourceOptimization(unittest.TestCase):
         ) as mock_longbridge:
             mock_longbridge.has_configured_credentials.return_value = True
             manager = DataFetcherManager()
+            second_manager = DataFetcherManager()
 
         self.assertIn("LongbridgeFetcher", manager.available_fetchers)
+        self.assertIn("LongbridgeFetcher", second_manager.available_fetchers)
         self.assertIn("TencentFetcher", manager.available_fetchers)
         mock_longbridge.assert_called_once()
 

@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from data_provider.longbridge_fetcher import (
     LongbridgeFetcher,
+    get_shared_longbridge_fetcher,
+    reset_shared_longbridge_fetcher,
     _to_longbridge_symbol,
     _is_us_code,
     _is_hk_code,
@@ -85,6 +87,55 @@ class TestLongbridgeFetcherNoCredentials(unittest.TestCase):
 
     def test_is_available_false(self):
         self.assertFalse(self.fetcher._is_available())
+
+
+class TestSharedLongbridgeFetcher(unittest.TestCase):
+    def tearDown(self):
+        reset_shared_longbridge_fetcher()
+
+    def test_reuses_fetcher_for_same_runtime_config(self):
+        config = SimpleNamespace(
+            longbridge_app_key="",
+            longbridge_app_secret="",
+            longbridge_access_token="",
+            longbridge_oauth_client_id="client-1",
+        )
+
+        first = get_shared_longbridge_fetcher(config)
+        second = get_shared_longbridge_fetcher(config)
+
+        self.assertIs(first, second)
+        self.assertIs(first._manager_call_lock, second._manager_call_lock)
+
+    def test_rebuilds_fetcher_when_credentials_change(self):
+        first = get_shared_longbridge_fetcher(
+            SimpleNamespace(longbridge_oauth_client_id="client-1")
+        )
+        second = get_shared_longbridge_fetcher(
+            SimpleNamespace(longbridge_oauth_client_id="client-2")
+        )
+
+        self.assertIsNot(first, second)
+
+    def test_sdk_environment_normalization_does_not_rebuild_fetcher(self):
+        config = SimpleNamespace(longbridge_oauth_client_id="client-1")
+        with patch.dict(
+            os.environ,
+            {
+                "LONGBRIDGE_REGION": "hk",
+                "LONGPORT_REGION": "",
+                "LONGBRIDGE_HTTP_URL": "",
+                "LONGBRIDGE_QUOTE_WS_URL": "",
+            },
+            clear=False,
+        ):
+            first = get_shared_longbridge_fetcher(config)
+            os.environ["LONGPORT_REGION"] = "hk"
+            os.environ["LONGBRIDGE_HTTP_URL"] = "https://openapi.longbridge.com"
+            os.environ["LONGBRIDGE_QUOTE_WS_URL"] = "wss://openapi-quote.longbridge.com/v2"
+            second = get_shared_longbridge_fetcher(config)
+
+        self.assertIs(first, second)
 
 
 class TestLongbridgeAuthSelection(unittest.TestCase):
