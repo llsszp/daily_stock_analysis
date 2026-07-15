@@ -27,6 +27,28 @@ echo "访问地址：${URL}"
 echo "关闭此窗口或按 Control-C 可停止项目。"
 echo
 
+SCHEDULER_PID=""
+WEB_PID=""
+OPENER_PID=""
+
+cleanup() {
+  trap - EXIT
+  for pid in "$OPENER_PID" "$WEB_PID" "$SCHEDULER_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      kill -TERM "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+  for pid in "$WEB_PID" "$SCHEDULER_PID"; do
+    if [[ -n "$pid" ]]; then
+      wait "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
 (
   for _ in {1..90}; do
     if curl -fsS --max-time 1 "$URL" >/dev/null 2>&1; then
@@ -36,5 +58,17 @@ echo
     sleep 1
   done
 ) &
+OPENER_PID=$!
 
-exec .venv/bin/python main.py --serve --schedule --host 127.0.0.1 --port "$PORT"
+# Keep scheduled analysis and alert polling outside the Web process. A slow
+# market-data SDK call can then delay one refresh without freezing the page.
+WEBUI_ENABLED=false .venv/bin/python main.py --schedule --no-run-immediately &
+SCHEDULER_PID=$!
+
+.venv/bin/python main.py --serve-only --host 127.0.0.1 --port "$PORT" &
+WEB_PID=$!
+
+wait "$WEB_PID"
+STATUS=$?
+
+exit "$STATUS"
