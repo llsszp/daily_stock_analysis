@@ -84,6 +84,8 @@ export interface AlertRuleCreateRequest {
   enabled?: boolean;
 }
 
+export type AlertRuleUpdateRequest = Partial<AlertRuleCreateRequest>;
+
 export interface AlertDeleteResponse {
   deleted: number;
 }

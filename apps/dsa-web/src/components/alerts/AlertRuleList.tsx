@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useState } from 'react';
-import { Bell, Trash2 } from 'lucide-react';
+import { Bell, Pencil, Trash2 } from 'lucide-react';
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Pagination, Select } from '../common';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
 import { formatUiText, type UiLanguage } from '../../i18n/uiText';
@@ -109,6 +109,7 @@ interface AlertRuleListProps {
   onAlertTypeFilterChange: (value: AlertTypeFilter) => void;
   onPageChange: (page: number) => void;
   onToggleEnabled: (rule: AlertRuleItem) => void;
+  onEdit: (rule: AlertRuleItem) => void;
   onDelete: (rule: AlertRuleItem) => void;
   onTest: (rule: AlertRuleItem) => void;
   busyRule?: AlertRuleBusyState | null;
@@ -127,6 +128,7 @@ export const AlertRuleList: React.FC<AlertRuleListProps> = ({
   onAlertTypeFilterChange,
   onPageChange,
   onToggleEnabled,
+  onEdit,
   onDelete,
   onTest,
   busyRule = null,
@@ -187,7 +189,9 @@ export const AlertRuleList: React.FC<AlertRuleListProps> = ({
                 <th className="px-3 py-2 font-medium">{text.status}</th>
                 <th className="px-3 py-2 font-medium">{text.cooldown}</th>
                 <th className="px-3 py-2 font-medium">{text.updatedAt}</th>
-                <th className="px-3 py-2 text-right font-medium">{text.action}</th>
+                <th className="sticky right-0 z-10 min-w-[184px] border-l border-border/60 bg-card px-3 py-2 text-right font-medium">
+                  {text.action}
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/40">
@@ -223,8 +227,8 @@ export const AlertRuleList: React.FC<AlertRuleListProps> = ({
                     ) : null}
                   </td>
                   <td className="px-3 py-3 text-xs text-secondary-text">{formatDateTime(rule.updatedAt ?? rule.createdAt)}</td>
-                  <td className="px-3 py-3">
-                    <div className="flex justify-end gap-2">
+                  <td className="sticky right-0 z-[5] min-w-[184px] border-l border-border/60 bg-card px-3 py-3">
+                    <div className="grid grid-cols-2 gap-2">
                       <Button
                         size="xsm"
                         variant="outline"
@@ -234,6 +238,16 @@ export const AlertRuleList: React.FC<AlertRuleListProps> = ({
                         disabled={isRuleBusy(rule) && !isRuleActionBusy(rule, 'test')}
                       >
                         {text.test}
+                      </Button>
+                      <Button
+                        size="xsm"
+                        variant="outline"
+                        aria-label={formatUiText(text.editAria, { name: rule.name })}
+                        onClick={() => onEdit(rule)}
+                        disabled={isRuleBusy(rule)}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        {text.edit}
                       </Button>
                       <Button
                         size="xsm"

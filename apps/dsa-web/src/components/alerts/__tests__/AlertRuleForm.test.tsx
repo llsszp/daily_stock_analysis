@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../../utils/uiLanguage';
 import { AlertRuleForm } from '../AlertRuleForm';
+import type { AlertRuleItem } from '../../../types/alerts';
 
 const { getAccounts } = vi.hoisted(() => ({
   getAccounts: vi.fn(),
@@ -91,6 +92,51 @@ describe('AlertRuleForm', () => {
         parameters: { activationPrice: 200, trailMode: 'percent', trailValue: 6 },
       }));
     });
+  });
+
+  it('prefills and submits an existing trailing-stop rule', async () => {
+    const onCancelEdit = vi.fn();
+    const editingRule: AlertRuleItem = {
+      id: 8,
+      name: 'AAPL 跟踪止损',
+      targetScope: 'single_symbol',
+      target: 'AAPL',
+      alertType: 'trailing_stop',
+      parameters: { activationPrice: 200, trailMode: 'amount', trailValue: 5 },
+      severity: 'critical',
+      enabled: true,
+      source: 'api',
+    };
+    render(
+      <AlertRuleForm
+        onSubmit={onSubmit}
+        editingRule={editingRule}
+        onCancelEdit={onCancelEdit}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: '编辑告警规则' })).toBeInTheDocument();
+    expect(screen.getByLabelText('规则名称')).toHaveValue('AAPL 跟踪止损');
+    expect(screen.getByLabelText('标的代码')).toHaveValue('AAPL');
+    expect(screen.getByLabelText('启用跟踪价格')).toHaveValue(200);
+    expect(screen.getByLabelText('回撤方式')).toHaveValue('amount');
+    expect(screen.getByLabelText('最高价回撤金额')).toHaveValue(5);
+
+    fireEvent.change(screen.getByLabelText('最高价回撤金额'), { target: { value: '8' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({
+      name: 'AAPL 跟踪止损',
+      targetScope: 'single_symbol',
+      target: 'AAPL',
+      alertType: 'trailing_stop',
+      parameters: { activationPrice: 200, trailMode: 'amount', trailValue: 8 },
+      severity: 'critical',
+      enabled: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: '取消编辑' }));
+    expect(onCancelEdit).toHaveBeenCalledTimes(1);
   });
 
   it('submits a volume_spike rule payload and supports disabled creation', async () => {

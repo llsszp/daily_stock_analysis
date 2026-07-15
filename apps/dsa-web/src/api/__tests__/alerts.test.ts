@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { alertsApi } from '../alerts';
 
-const { get, post, deleteRequest } = vi.hoisted(() => ({
+const { get, post, patchRequest, deleteRequest } = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
+  patchRequest: vi.fn(),
   deleteRequest: vi.fn(),
 }));
 
@@ -11,6 +12,7 @@ vi.mock('../index', () => ({
   default: {
     get,
     post,
+    patch: patchRequest,
     delete: deleteRequest,
   },
 }));
@@ -19,6 +21,7 @@ describe('alertsApi', () => {
   beforeEach(() => {
     get.mockReset();
     post.mockReset();
+    patchRequest.mockReset();
     deleteRequest.mockReset();
   });
 
@@ -197,6 +200,31 @@ describe('alertsApi', () => {
       enabled: true,
     });
     expect(created.parameters.trailMode).toBe('percent');
+  });
+
+  it('updates rules with a partial snake_case payload', async () => {
+    patchRequest.mockResolvedValueOnce({
+      data: {
+        id: 8,
+        name: 'AAPL trailing stop',
+        target_scope: 'single_symbol',
+        target: 'AAPL',
+        alert_type: 'trailing_stop',
+        parameters: { activation_price: 200, trail_mode: 'amount', trail_value: 8 },
+        severity: 'warning',
+        enabled: true,
+        source: 'api',
+      },
+    });
+
+    const updated = await alertsApi.updateRule(8, {
+      parameters: { activationPrice: 200, trailMode: 'amount', trailValue: 8 },
+    });
+
+    expect(patchRequest).toHaveBeenCalledWith('/api/v1/alerts/rules/8', {
+      parameters: { activation_price: 200, trail_mode: 'amount', trail_value: 8 },
+    });
+    expect(updated.parameters.trailValue).toBe(8);
   });
 
   it('creates market light rules with market scope and min_drop parameter fields', async () => {

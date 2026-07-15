@@ -661,6 +661,47 @@ class AlertApiTestCase(unittest.TestCase):
             AlertRepository(self.db).get_trailing_state(rule_id=rule["id"], target="AAPL")
         )
 
+    def test_trailing_stop_update_resets_state_only_when_tracking_config_changes(self) -> None:
+        rule = self._create_rule({
+            "name": "AAPL trailing stop",
+            "target": "AAPL",
+            "alert_type": "trailing_stop",
+            "parameters": {
+                "activation_price": 200,
+                "trail_mode": "amount",
+                "trail_value": 5,
+            },
+        })
+        repo = AlertRepository(self.db)
+        repo.upsert_trailing_state(
+            rule_id=rule["id"],
+            target="AAPL",
+            activated_at=datetime.now(),
+            peak_price=220,
+            last_price=218,
+            data_timestamp=datetime.now(),
+        )
+
+        unchanged = self.client.patch(
+            f"/api/v1/alerts/rules/{rule['id']}",
+            json={"severity": "critical", "parameters": rule["parameters"]},
+        )
+        self.assertEqual(unchanged.status_code, 200, unchanged.text)
+        self.assertIsNotNone(repo.get_trailing_state(rule_id=rule["id"], target="AAPL"))
+
+        changed = self.client.patch(
+            f"/api/v1/alerts/rules/{rule['id']}",
+            json={
+                "parameters": {
+                    "activation_price": 200,
+                    "trail_mode": "amount",
+                    "trail_value": 8,
+                },
+            },
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertIsNone(repo.get_trailing_state(rule_id=rule["id"], target="AAPL"))
+
     def test_trailing_stop_rejects_invalid_percent(self) -> None:
         resp = self.client.post("/api/v1/alerts/rules", json={
             "target_scope": "single_symbol",

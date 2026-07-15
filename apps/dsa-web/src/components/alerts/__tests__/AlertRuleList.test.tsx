@@ -57,6 +57,7 @@ describe('AlertRuleList', () => {
   const onAlertTypeFilterChange = vi.fn();
   const onPageChange = vi.fn();
   const onToggleEnabled = vi.fn();
+  const onEdit = vi.fn();
   const onDelete = vi.fn();
   const onTest = vi.fn();
 
@@ -78,6 +79,7 @@ describe('AlertRuleList', () => {
         onAlertTypeFilterChange={onAlertTypeFilterChange}
         onPageChange={onPageChange}
         onToggleEnabled={onToggleEnabled}
+        onEdit={onEdit}
         onDelete={onDelete}
         onTest={onTest}
         {...overrides}
@@ -100,6 +102,7 @@ describe('AlertRuleList', () => {
           onAlertTypeFilterChange={onAlertTypeFilterChange}
           onPageChange={onPageChange}
           onToggleEnabled={onToggleEnabled}
+          onEdit={onEdit}
           onDelete={onDelete}
           onTest={onTest}
           {...overrides}
@@ -257,6 +260,14 @@ describe('AlertRuleList', () => {
 
     expect(onTest).toHaveBeenCalledWith(rules[0]);
     expect(onToggleEnabled).toHaveBeenCalledWith(rules[0]);
+  });
+
+  it('opens the selected rule for editing', () => {
+    renderList();
+
+    fireEvent.click(screen.getByLabelText('编辑 茅台价格突破'));
+
+    expect(onEdit).toHaveBeenCalledWith(rules[0]);
   });
 
   it('shows loading text only for the active rule operation', () => {

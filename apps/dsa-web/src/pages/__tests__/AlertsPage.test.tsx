@@ -5,6 +5,7 @@ import AlertsPage from '../AlertsPage';
 const {
   listRules,
   createRule,
+  updateRule,
   deleteRule,
   enableRule,
   disableRule,
@@ -14,6 +15,7 @@ const {
 } = vi.hoisted(() => ({
   listRules: vi.fn(),
   createRule: vi.fn(),
+  updateRule: vi.fn(),
   deleteRule: vi.fn(),
   enableRule: vi.fn(),
   disableRule: vi.fn(),
@@ -26,6 +28,7 @@ vi.mock('../../api/alerts', () => ({
   alertsApi: {
     listRules,
     createRule,
+    updateRule,
     deleteRule,
     enableRule,
     disableRule,
@@ -102,6 +105,7 @@ beforeEach(() => {
     message: '600519 price above 1800',
   });
   createRule.mockResolvedValue(rule);
+  updateRule.mockResolvedValue(rule);
   disableRule.mockResolvedValue({ ...rule, enabled: false });
   enableRule.mockResolvedValue(rule);
   deleteRule.mockResolvedValue({ deleted: 1 });
@@ -196,6 +200,24 @@ describe('AlertsPage', () => {
       }));
     });
     expect(await screen.findByText(/已创建告警规则/)).toBeInTheDocument();
+  });
+
+  it('edits a rule in place and sends only changed fields', async () => {
+    render(<AlertsPage />);
+
+    await screen.findByText('茅台价格突破');
+    fireEvent.click(screen.getByLabelText('编辑 茅台价格突破'));
+    expect(screen.getByRole('heading', { name: '编辑告警规则' })).toBeInTheDocument();
+    expect(screen.getByLabelText('标的代码')).toHaveValue('600519');
+    expect(screen.getByLabelText('价格阈值')).toHaveValue(1800);
+
+    fireEvent.change(screen.getByLabelText('价格阈值'), { target: { value: '1900' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+
+    await waitFor(() => expect(updateRule).toHaveBeenCalledWith(1, {
+      parameters: { direction: 'above', price: 1900 },
+    }));
+    expect(await screen.findByText(/已更新告警规则/)).toBeInTheDocument();
   });
 
   it('keeps create form values when create API fails', async () => {

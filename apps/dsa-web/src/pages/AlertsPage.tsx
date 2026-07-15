@@ -18,12 +18,38 @@ import type {
   AlertRuleCreateRequest,
   AlertRuleItem,
   AlertRuleTestResponse,
+  AlertRuleUpdateRequest,
   AlertTriggerItem,
   AlertType,
 } from '../types/alerts';
 import { formatDateTime } from '../utils/format';
 
 const PAGE_SIZE = 20;
+
+function canonicalParameters(parameters: AlertRuleCreateRequest['parameters']): string {
+  return JSON.stringify(
+    Object.entries(parameters)
+      .filter(([, value]) => value !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+function buildRuleUpdatePayload(
+  rule: AlertRuleItem,
+  payload: AlertRuleCreateRequest,
+): AlertRuleUpdateRequest {
+  const update: AlertRuleUpdateRequest = {};
+  if ((payload.name ?? rule.name) !== rule.name) update.name = payload.name;
+  if (payload.targetScope !== rule.targetScope) update.targetScope = payload.targetScope;
+  if (payload.target !== rule.target) update.target = payload.target;
+  if (payload.alertType !== rule.alertType) update.alertType = payload.alertType;
+  if (payload.severity !== rule.severity) update.severity = payload.severity;
+  if ((payload.enabled ?? rule.enabled) !== rule.enabled) update.enabled = payload.enabled;
+  if (canonicalParameters(payload.parameters) !== canonicalParameters(rule.parameters)) {
+    update.parameters = payload.parameters;
+  }
+  return update;
+}
 
 function enabledFilterToQuery(value: AlertRuleEnabledFilter): boolean | undefined {
   if (value === 'enabled') return true;
@@ -122,9 +148,12 @@ const AlertsPage: React.FC = () => {
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState<ParsedApiError | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
+  const [createSuccessTitle, setCreateSuccessTitle] = useState('创建成功');
+  const [editingRule, setEditingRule] = useState<AlertRuleItem | null>(null);
   const [busyRule, setBusyRule] = useState<AlertRuleBusyState | null>(null);
   const [testResult, setTestResult] = useState<AlertRuleTestResponse | null>(null);
   const rulesRequestIdRef = useRef(0);
+  const formRef = useRef<HTMLDivElement | null>(null);
 
   const loadRules = useCallback(async (pageOverride?: number) => {
     const requestId = rulesRequestIdRef.current + 1;
@@ -200,12 +229,28 @@ const AlertsPage: React.FC = () => {
     void loadNotifications();
   }, [loadNotifications, loadTriggers, rulesLoaded]);
 
-  const handleCreateRule = async (payload: AlertRuleCreateRequest) => {
+  const handleSubmitRule = async (payload: AlertRuleCreateRequest) => {
     setCreateLoading(true);
     setCreateError(null);
     setCreateSuccess(null);
     try {
+      if (editingRule) {
+        const update = buildRuleUpdatePayload(editingRule, payload);
+        if (Object.keys(update).length === 0) {
+          setCreateSuccessTitle('无需修改');
+          setCreateSuccess('规则内容没有变化');
+          setEditingRule(null);
+          return true;
+        }
+        const updated = await alertsApi.updateRule(editingRule.id, update);
+        setCreateSuccessTitle('保存成功');
+        setCreateSuccess(`已更新告警规则「${updated.name}」`);
+        setEditingRule(null);
+        await loadRules();
+        return true;
+      }
       const created = await alertsApi.createRule(payload);
+      setCreateSuccessTitle('创建成功');
       setCreateSuccess(`已创建告警规则「${created.name}」`);
       await loadRules(1);
       return true;
@@ -215,6 +260,15 @@ const AlertsPage: React.FC = () => {
     } finally {
       setCreateLoading(false);
     }
+  };
+
+  const handleEditRule = (rule: AlertRuleItem) => {
+    setEditingRule(rule);
+    setCreateError(null);
+    setCreateSuccess(null);
+    requestAnimationFrame(() => {
+      formRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    });
   };
 
   const handleToggleEnabled = async (rule: AlertRuleItem) => {
@@ -237,6 +291,7 @@ const AlertsPage: React.FC = () => {
     setBusyRule({ id: rule.id, action: 'delete' });
     try {
       await alertsApi.deleteRule(rule.id);
+      if (editingRule?.id === rule.id) setEditingRule(null);
       await loadRules();
     } catch (error) {
       setRulesError(getParsedApiError(error));
@@ -269,7 +324,7 @@ const AlertsPage: React.FC = () => {
       {createError ? <ApiErrorAlert error={createError} onDismiss={() => setCreateError(null)} /> : null}
       {createSuccess ? (
         <InlineAlert
-          title="创建成功"
+          title={createSuccessTitle}
           message={createSuccess}
           variant="success"
           action={(
@@ -282,10 +337,21 @@ const AlertsPage: React.FC = () => {
       {rulesError ? <ApiErrorAlert error={rulesError} onDismiss={() => setRulesError(null)} /> : null}
 
       <div className="grid items-stretch gap-5 xl:grid-cols-[380px_minmax(0,1fr)]">
-        <AlertRuleForm onSubmit={handleCreateRule} isSubmitting={createLoading} />
-        <div className="flex h-full min-h-0 flex-col gap-4">
+        <div ref={formRef}>
+          <AlertRuleForm
+            key={editingRule?.id ?? 'create'}
+            onSubmit={handleSubmitRule}
+            isSubmitting={createLoading}
+            editingRule={editingRule}
+            onCancelEdit={() => {
+              setEditingRule(null);
+              setCreateError(null);
+            }}
+          />
+        </div>
+        <div className="flex h-full min-h-0 min-w-0 flex-col gap-4">
           <AlertRuleList
-            className="flex h-full min-h-0 flex-col"
+            className="flex h-full min-h-0 min-w-0 flex-col"
             rules={rules}
             total={rulesTotal}
             page={rulesPage}
@@ -303,6 +369,7 @@ const AlertsPage: React.FC = () => {
             }}
             onPageChange={setRulesPage}
             onToggleEnabled={(rule) => void handleToggleEnabled(rule)}
+            onEdit={handleEditRule}
             onDelete={(rule) => void handleDeleteRule(rule)}
             onTest={(rule) => void handleTestRule(rule)}
             busyRule={busyRule}

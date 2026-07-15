@@ -9,6 +9,7 @@ import type {
   AlertRuleListQuery,
   AlertRuleListResponse,
   AlertRuleTestResponse,
+  AlertRuleUpdateRequest,
   AlertTriggerListQuery,
   AlertTriggerListResponse,
 } from '../types/alerts';
@@ -19,7 +20,7 @@ function omitUndefined(input: Record<string, unknown>): Record<string, unknown> 
   );
 }
 
-function toSnakeRulePayload(payload: AlertRuleCreateRequest): Record<string, unknown> {
+function toSnakeRulePayload(payload: AlertRuleCreateRequest | AlertRuleUpdateRequest): Record<string, unknown> {
   const request: Record<string, unknown> = {};
   if (payload.name !== undefined) request.name = payload.name;
   if (payload.targetScope !== undefined) request.target_scope = payload.targetScope;
@@ -95,6 +96,14 @@ export const alertsApi = {
   async createRule(payload: AlertRuleCreateRequest): Promise<AlertRuleItem> {
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/alerts/rules',
+      toSnakeRulePayload(payload),
+    );
+    return toCamelCase<AlertRuleItem>(response.data);
+  },
+
+  async updateRule(ruleId: number, payload: AlertRuleUpdateRequest): Promise<AlertRuleItem> {
+    const response = await apiClient.patch<Record<string, unknown>>(
+      `/api/v1/alerts/rules/${ruleId}`,
       toSnakeRulePayload(payload),
     );
     return toCamelCase<AlertRuleItem>(response.data);

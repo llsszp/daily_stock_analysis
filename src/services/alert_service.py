@@ -143,10 +143,16 @@ class AlertService:
         updated = self.repo.update_rule(rule_id, fields)
         if updated is None:
             raise AlertNotFoundError(f"Alert rule not found: {rule_id}")
+        original = self._serialize_rule_base(row)
+        current = self._serialize_rule_base(updated)
+        tracking_config_changed = any(
+            original.get(key) != current.get(key)
+            for key in ("target", "alert_type", "parameters")
+        )
         if (
             row.alert_type == TRAILING_STOP_ALERT_TYPE
             or updated.alert_type == TRAILING_STOP_ALERT_TYPE
-        ) and {"target", "alert_type", "parameters"} & set(payload):
+        ) and tracking_config_changed:
             self.repo.delete_trailing_state(rule_id)
         return self._serialize_rule(updated)
 

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { portfolioApi } from '../../api/portfolio';
 import type {
   AlertRuleCreateRequest,
+  AlertRuleItem,
   AlertSeverity,
   AlertTargetScope,
   AlertType,
@@ -106,6 +107,8 @@ const MAX_REQUESTED_DAYS = 365;
 interface AlertRuleFormProps {
   onSubmit: (payload: AlertRuleCreateRequest) => Promise<boolean | void> | boolean | void;
   isSubmitting?: boolean;
+  editingRule?: AlertRuleItem | null;
+  onCancelEdit?: () => void;
 }
 
 function isPortfolioScope(scope: AlertTargetScope): boolean {
@@ -126,40 +129,52 @@ function optionsForScope(scope: AlertTargetScope, language: UiLanguage) {
   return scope === 'portfolio_account' ? ALERT_PORTFOLIO_TYPE_OPTIONS[language] : ALERT_SYMBOL_TYPE_OPTIONS[language];
 }
 
-export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmitting = false }) => {
+export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({
+  onSubmit,
+  isSubmitting = false,
+  editingRule = null,
+  onCancelEdit,
+}) => {
   const { language } = useUiLanguage();
   const text = ALERT_FORM_TEXT[language];
-  const [name, setName] = useState('');
-  const [targetScope, setTargetScope] = useState<AlertTargetScope>('single_symbol');
-  const [target, setTarget] = useState('');
-  const [portfolioTarget, setPortfolioTarget] = useState('all');
-  const [marketRegion, setMarketRegion] = useState<MarketRegion>('cn');
+  const initialParameters = editingRule?.parameters ?? {};
+  const initialScope = editingRule?.targetScope ?? 'single_symbol';
+  const [name, setName] = useState(editingRule?.name ?? '');
+  const [targetScope, setTargetScope] = useState<AlertTargetScope>(initialScope);
+  const [target, setTarget] = useState(initialScope === 'single_symbol' ? editingRule?.target ?? '' : '');
+  const [portfolioTarget, setPortfolioTarget] = useState(isPortfolioScope(initialScope) ? editingRule?.target ?? 'all' : 'all');
+  const [marketRegion, setMarketRegion] = useState<MarketRegion>(
+    initialScope === 'market' && ['cn', 'hk', 'us'].includes(editingRule?.target ?? '')
+      ? editingRule?.target as MarketRegion
+      : 'cn',
+  );
   const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
   const [accountsError, setAccountsError] = useState<string | null>(null);
-  const [alertType, setAlertType] = useState<AlertType>('price_cross');
-  const [severity, setSeverity] = useState<AlertSeverity>('warning');
-  const [enabled, setEnabled] = useState(true);
-  const [priceDirection, setPriceDirection] = useState<'above' | 'below'>('above');
-  const [changeDirection, setChangeDirection] = useState<'up' | 'down'>('up');
-  const [thresholdDirection, setThresholdDirection] = useState<'above' | 'below'>('above');
-  const [crossDirection, setCrossDirection] = useState<'bullish_cross' | 'bearish_cross'>('bullish_cross');
-  const [stopLossMode, setStopLossMode] = useState<PortfolioStopLossMode>('near');
-  const [price, setPrice] = useState('');
-  const [activationPrice, setActivationPrice] = useState('');
-  const [trailMode, setTrailMode] = useState<TrailingStopMode>('percent');
-  const [trailValue, setTrailValue] = useState('5');
-  const [changePct, setChangePct] = useState('');
-  const [multiplier, setMultiplier] = useState('');
-  const [window, setWindow] = useState('20');
-  const [period, setPeriod] = useState('12');
-  const [threshold, setThreshold] = useState('');
-  const [fastPeriod, setFastPeriod] = useState('12');
-  const [slowPeriod, setSlowPeriod] = useState('26');
-  const [signalPeriod, setSignalPeriod] = useState('9');
-  const [kPeriod, setKPeriod] = useState('3');
-  const [dPeriod, setDPeriod] = useState('3');
-  const [marketLightStatuses, setMarketLightStatuses] = useState<MarketLightStatus[]>(['red', 'yellow']);
-  const [minDrop, setMinDrop] = useState('10');
+  const initialAlertType = editingRule?.alertType ?? 'price_cross';
+  const [alertType, setAlertType] = useState<AlertType>(initialAlertType);
+  const [severity, setSeverity] = useState<AlertSeverity>(editingRule?.severity ?? 'warning');
+  const [enabled, setEnabled] = useState(editingRule?.enabled ?? true);
+  const [priceDirection, setPriceDirection] = useState<'above' | 'below'>(initialParameters.direction === 'below' ? 'below' : 'above');
+  const [changeDirection, setChangeDirection] = useState<'up' | 'down'>(initialParameters.direction === 'down' ? 'down' : 'up');
+  const [thresholdDirection, setThresholdDirection] = useState<'above' | 'below'>(initialParameters.direction === 'below' ? 'below' : 'above');
+  const [crossDirection, setCrossDirection] = useState<'bullish_cross' | 'bearish_cross'>(initialParameters.direction === 'bearish_cross' ? 'bearish_cross' : 'bullish_cross');
+  const [stopLossMode, setStopLossMode] = useState<PortfolioStopLossMode>(initialParameters.mode === 'breach' ? 'breach' : 'near');
+  const [price, setPrice] = useState(initialParameters.price == null ? '' : String(initialParameters.price));
+  const [activationPrice, setActivationPrice] = useState(initialParameters.activationPrice == null ? '' : String(initialParameters.activationPrice));
+  const [trailMode, setTrailMode] = useState<TrailingStopMode>(initialParameters.trailMode === 'amount' ? 'amount' : 'percent');
+  const [trailValue, setTrailValue] = useState(initialParameters.trailValue == null ? '5' : String(initialParameters.trailValue));
+  const [changePct, setChangePct] = useState(initialParameters.changePct == null ? '' : String(initialParameters.changePct));
+  const [multiplier, setMultiplier] = useState(initialParameters.multiplier == null ? '' : String(initialParameters.multiplier));
+  const [window, setWindow] = useState(initialParameters.window == null ? '20' : String(initialParameters.window));
+  const [period, setPeriod] = useState(initialParameters.period == null ? (initialAlertType === 'kdj_cross' ? '9' : initialAlertType === 'cci_threshold' ? '14' : '12') : String(initialParameters.period));
+  const [threshold, setThreshold] = useState(initialParameters.threshold == null ? '' : String(initialParameters.threshold));
+  const [fastPeriod, setFastPeriod] = useState(initialParameters.fastPeriod == null ? '12' : String(initialParameters.fastPeriod));
+  const [slowPeriod, setSlowPeriod] = useState(initialParameters.slowPeriod == null ? '26' : String(initialParameters.slowPeriod));
+  const [signalPeriod, setSignalPeriod] = useState(initialParameters.signalPeriod == null ? '9' : String(initialParameters.signalPeriod));
+  const [kPeriod, setKPeriod] = useState(initialParameters.kPeriod == null ? '3' : String(initialParameters.kPeriod));
+  const [dPeriod, setDPeriod] = useState(initialParameters.dPeriod == null ? '3' : String(initialParameters.dPeriod));
+  const [marketLightStatuses, setMarketLightStatuses] = useState<MarketLightStatus[]>(initialParameters.statuses?.length ? initialParameters.statuses : ['red', 'yellow']);
+  const [minDrop, setMinDrop] = useState(initialParameters.minDrop == null ? '10' : String(initialParameters.minDrop));
   const [formError, setFormError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -411,7 +426,7 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
 
     setFormError(null);
     const submitted = await onSubmit({
-      name: name.trim() || undefined,
+      name: name.trim() || editingRule?.name || undefined,
       targetScope,
       target: resolvedTarget,
       alertType,
@@ -420,6 +435,7 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
       enabled,
     });
     if (submitted === false) return;
+    if (editingRule) return;
     setName('');
     setTarget('');
     setPortfolioTarget('all');
@@ -492,7 +508,12 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
   };
 
   return (
-    <Card title={text.cardTitle} subtitle={text.cardSubtitle} variant="bordered" padding="md">
+    <Card
+      title={editingRule ? text.editCardTitle : text.cardTitle}
+      subtitle={editingRule ? text.editCardSubtitle : text.cardSubtitle}
+      variant="bordered"
+      padding="md"
+    >
       <form className="space-y-4" noValidate onSubmit={(event) => void handleSubmit(event)}>
         <div className="grid gap-4 md:grid-cols-2">
           <Input
@@ -826,14 +847,21 @@ export const AlertRuleForm: React.FC<AlertRuleFormProps> = ({ onSubmit, isSubmit
 
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <Checkbox
-            label={text.enableAfterCreate}
+            label={editingRule ? text.enableAfterEdit : text.enableAfterCreate}
             checked={enabled}
             onChange={(event) => setEnabled(event.target.checked)}
             disabled={isSubmitting}
           />
-          <Button type="submit" isLoading={isSubmitting} loadingText={text.creating}>
-            {text.create}
-          </Button>
+          <div className="flex justify-end gap-2">
+            {editingRule && onCancelEdit ? (
+              <Button type="button" variant="secondary" onClick={onCancelEdit} disabled={isSubmitting}>
+                {text.cancelEdit}
+              </Button>
+            ) : null}
+            <Button type="submit" isLoading={isSubmitting} loadingText={editingRule ? text.saving : text.creating}>
+              {editingRule ? text.save : text.create}
+            </Button>
+          </div>
         </div>
         {formError ? <p role="alert" className="text-sm text-danger">{formError}</p> : null}
       </form>
