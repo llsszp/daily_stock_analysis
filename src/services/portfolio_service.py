@@ -270,7 +270,10 @@ class PortfolioService:
         if amount <= 0:
             raise ValueError("amount must be > 0")
         with self.repo.portfolio_write_session() as session:
-            account = self._require_active_account_in_session(session=session, account_id=account_id)
+            account = self._require_active_account_in_session(
+                session=session,
+                account_id=account_id,
+            )
             currency_norm = self._normalize_currency(currency or account.base_currency)
             row = self.repo.add_cash_ledger_in_session(
                 session=session,
@@ -388,6 +391,120 @@ class PortfolioService:
                 symbols=symbol_filters,
             )
             return deleted
+
+    def replace_account_position_snapshot(
+        self,
+        *,
+        account_id: int,
+        records: List[Dict[str, Any]],
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Atomically replace one US account's positions from a broker snapshot."""
+        if not records:
+            raise ValueError("嘉信持仓快照没有可导入的持仓，已拒绝清空原账户")
+
+        prepared: List[Dict[str, Any]] = []
+        seen_symbols: set[str] = set()
+        seen_trade_uids: set[str] = set()
+        seen_dedup_hashes: set[str] = set()
+        for index, record in enumerate(records):
+            symbol = self._normalize_symbol_for_storage(str(record.get("symbol") or ""))
+            if not symbol:
+                raise ValueError(f"idx={index}: symbol is required")
+            if symbol in seen_symbols:
+                raise ValueError(f"嘉信持仓快照包含重复股票代码: {symbol}")
+            seen_symbols.add(symbol)
+
+            side = str(record.get("side") or "").strip().lower()
+            if side != "buy":
+                raise ValueError(f"idx={index}: 嘉信持仓快照仅支持多头持仓")
+            quantity = float(record.get("quantity") or 0)
+            price = float(record.get("price") or 0)
+            fee = float(record.get("fee", 0.0) or 0.0)
+            tax = float(record.get("tax", 0.0) or 0.0)
+            if quantity <= 0 or price <= 0:
+                raise ValueError(f"idx={index}: quantity and price must be > 0")
+            if fee < 0 or tax < 0:
+                raise ValueError(f"idx={index}: fee and tax must be >= 0")
+
+            trade_date_value = record.get("trade_date")
+            trade_date = (
+                trade_date_value
+                if isinstance(trade_date_value, date)
+                else date.fromisoformat(str(trade_date_value))
+            )
+            trade_uid = str(record.get("trade_uid") or "").strip() or None
+            dedup_hash = str(record.get("dedup_hash") or "").strip() or None
+            if trade_uid and trade_uid in seen_trade_uids:
+                raise ValueError(f"嘉信持仓快照包含重复交易标识: {trade_uid}")
+            if dedup_hash and dedup_hash in seen_dedup_hashes:
+                raise ValueError("嘉信持仓快照包含重复持仓记录")
+            if trade_uid:
+                seen_trade_uids.add(trade_uid)
+            if dedup_hash:
+                seen_dedup_hashes.add(dedup_hash)
+            prepared.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": trade_date,
+                    "quantity": quantity,
+                    "price": price,
+                    "fee": fee,
+                    "tax": tax,
+                    "trade_uid": trade_uid,
+                    "dedup_hash": dedup_hash,
+                    "market": record.get("market"),
+                    "currency": record.get("currency"),
+                }
+            )
+
+        with self.repo.portfolio_write_session() as session:
+            account = self._require_active_account_in_session(session=session, account_id=account_id)
+            if self._normalize_market(account.market) != "us":
+                raise ValueError("嘉信持仓快照只能替换美股账户，请先选择正确的嘉信账户")
+            old_trade_count, old_action_count = self.repo.count_account_position_events_in_session(
+                session=session,
+                account_id=account_id,
+            )
+            if dry_run:
+                return {
+                    "inserted_count": len(prepared),
+                    "replaced_trade_count": old_trade_count,
+                    "replaced_corporate_action_count": old_action_count,
+                }
+
+            self.repo.delete_account_position_events_in_session(
+                session=session,
+                account_id=account_id,
+            )
+            for record in prepared:
+                market = self._normalize_market(record.get("market") or account.market)
+                if market != "us":
+                    raise ValueError("嘉信持仓快照中包含非美股市场记录")
+                currency = self._normalize_currency(
+                    record.get("currency") or self._default_currency_for_market(market)
+                )
+                self.repo.add_trade_in_session(
+                    session=session,
+                    account_id=account_id,
+                    trade_uid=record["trade_uid"],
+                    symbol=record["symbol"],
+                    market=market,
+                    currency=currency,
+                    trade_date=record["trade_date"],
+                    side="buy",
+                    quantity=record["quantity"],
+                    price=record["price"],
+                    fee=record["fee"],
+                    tax=record["tax"],
+                    note="嘉信持仓快照同步",
+                    dedup_hash=record["dedup_hash"],
+                )
+            return {
+                "inserted_count": len(prepared),
+                "replaced_trade_count": old_trade_count,
+                "replaced_corporate_action_count": old_action_count,
+            }
 
     def delete_cash_ledger_event(self, entry_id: int) -> bool:
         with self.repo.portfolio_write_session() as session:

@@ -474,6 +474,56 @@ class PortfolioRepository:
         session.flush()
         return len(trades) + len(actions), from_date
 
+    def count_account_position_events_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+    ) -> Tuple[int, int]:
+        """Count events that build all positions in one account."""
+        trade_count = int(
+            session.execute(
+                select(func.count(PortfolioTrade.id)).where(
+                    PortfolioTrade.account_id == account_id
+                )
+            ).scalar_one()
+            or 0
+        )
+        action_count = int(
+            session.execute(
+                select(func.count(PortfolioCorporateAction.id)).where(
+                    PortfolioCorporateAction.account_id == account_id
+                )
+            ).scalar_one()
+            or 0
+        )
+        return trade_count, action_count
+
+    def delete_account_position_events_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+    ) -> Tuple[int, int]:
+        """Delete all position-building events and caches for one account."""
+        trade_count, action_count = self.count_account_position_events_in_session(
+            session=session,
+            account_id=account_id,
+        )
+        session.execute(delete(PortfolioTrade).where(PortfolioTrade.account_id == account_id))
+        session.execute(
+            delete(PortfolioCorporateAction).where(
+                PortfolioCorporateAction.account_id == account_id
+            )
+        )
+        self._invalidate_account_cache_in_session(
+            session=session,
+            account_id=account_id,
+            from_date=date.min,
+        )
+        session.flush()
+        return trade_count, action_count
+
     def delete_cash_ledger_in_session(self, *, session: Any, entry_id: int) -> bool:
         row = session.execute(
             select(PortfolioCashLedger).where(PortfolioCashLedger.id == entry_id).limit(1)

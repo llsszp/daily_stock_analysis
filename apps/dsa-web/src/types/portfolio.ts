@@ -328,6 +328,9 @@ export interface PortfolioImportCommitResponse {
   duplicateCount: number;
   failedCount: number;
   dryRun: boolean;
+  replaceExisting: boolean;
+  replacedTradeCount: number;
+  replacedCorporateActionCount: number;
   errors: string[];
 }
 

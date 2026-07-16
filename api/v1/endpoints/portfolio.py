@@ -669,19 +669,33 @@ def commit_csv_import(
     account_id: int = Form(...),
     broker: str = Form(..., description="Broker id: huatai/citic/cmb/schwab"),
     dry_run: bool = Form(False),
+    replace_existing: Optional[bool] = Form(
+        None,
+        description="Replace account positions; defaults to true for Schwab snapshots",
+    ),
     file: UploadFile = File(...),
 ) -> PortfolioImportCommitResponse:
     importer = PortfolioImportService()
     try:
         content = file.file.read()
         parsed = importer.parse_trade_csv(broker=broker, content=content)
+        should_replace = (
+            parsed["broker"] == "schwab"
+            if replace_existing is None
+            else bool(replace_existing)
+        )
+        if should_replace and int(parsed.get("error_count", 0)) > 0:
+            raise ValueError("嘉信持仓快照存在解析错误，已拒绝替换原账户持仓")
         result = importer.commit_trade_records(
             account_id=account_id,
             broker=parsed["broker"],
             records=list(parsed.get("records", [])),
             dry_run=dry_run,
+            replace_existing=should_replace,
         )
         return PortfolioImportCommitResponse(**result)
+    except PortfolioBusyError as exc:
+        raise _conflict_error(error="portfolio_busy", message=str(exc))
     except ValueError as exc:
         raise _bad_request(exc)
     except Exception as exc:

@@ -259,6 +259,9 @@ class PortfolioImportCommitResponse(BaseModel):
     duplicate_count: int
     failed_count: int
     dry_run: bool
+    replace_existing: bool = False
+    replaced_trade_count: int = 0
+    replaced_corporate_action_count: int = 0
     errors: List[str] = Field(default_factory=list)
 
 

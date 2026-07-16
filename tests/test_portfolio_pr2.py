@@ -23,6 +23,7 @@ except ModuleNotFoundError:
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
+from src.repositories.alert_repo import AlertRepository
 from src.services.decision_signal_service import DecisionSignalService
 from src.services.portfolio_import_service import PortfolioImportService
 from src.services.portfolio_risk_service import PortfolioRiskService
@@ -256,6 +257,203 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertEqual(first["inserted_count"], 2)
         self.assertEqual(second["inserted_count"], 0)
         self.assertEqual(second["duplicate_count"], 2)
+
+    def test_import_schwab_endpoint_replaces_account_snapshot_and_preserves_alerts(self) -> None:
+        account = self.service.create_account(
+            name="Schwab",
+            broker="Schwab",
+            market="us",
+            base_currency="USD",
+        )
+        account_id = account["id"]
+        self.service.record_trade(
+            account_id=account_id,
+            symbol="TSLA",
+            trade_date=date(2026, 7, 1),
+            side="buy",
+            quantity=3,
+            price=400,
+            market="us",
+            currency="USD",
+        )
+        self.service.record_corporate_action(
+            account_id=account_id,
+            symbol="TSLA",
+            effective_date=date(2026, 7, 2),
+            action_type="split_adjustment",
+            split_ratio=2,
+            market="us",
+            currency="USD",
+        )
+        self.service.record_cash_ledger(
+            account_id=account_id,
+            event_date=date(2026, 7, 1),
+            direction="in",
+            amount=5000,
+            currency="USD",
+        )
+        alert_repo = AlertRepository(self.db)
+        rule = alert_repo.create_rule(
+            {
+                "name": "TSLA 跟踪止损",
+                "target_scope": "single_symbol",
+                "target": "TSLA",
+                "alert_type": "trailing_stop",
+                "parameters": '{"activation_price":400,"trail_mode":"percent","trail_value":5}',
+                "severity": "warning",
+                "enabled": True,
+                "source": "api",
+            }
+        )
+
+        response = self.client.post(
+            "/api/v1/portfolio/imports/csv/commit",
+            data={"account_id": str(account_id), "broker": "schwab", "dry_run": "false"},
+            files={
+                "file": (
+                    "position-statement.csv",
+                    self._schwab_position_csv_bytes(),
+                    "text/csv",
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["replace_existing"])
+        self.assertEqual(payload["replaced_trade_count"], 1)
+        self.assertEqual(payload["replaced_corporate_action_count"], 1)
+        self.assertEqual(payload["inserted_count"], 2)
+        trades = self.service.repo.list_trades(account_id, date.max)
+        self.assertEqual([(row.symbol, row.quantity, row.price) for row in trades], [
+            ("AMZN", 1.0, 246.95),
+            ("MSFT", 7.0, 463.725),
+        ])
+        self.assertEqual(self.service.repo.list_corporate_actions(account_id, date.max), [])
+        self.assertEqual(len(self.service.repo.list_cash_ledger(account_id, date.max)), 1)
+        preserved_rule = alert_repo.get_rule(int(rule.id))
+        self.assertIsNotNone(preserved_rule)
+        self.assertEqual(preserved_rule.target, "TSLA")
+        self.assertTrue(preserved_rule.enabled)
+
+    def test_import_schwab_snapshot_dry_run_does_not_clear_positions(self) -> None:
+        account = self.service.create_account(
+            name="Schwab",
+            broker="Schwab",
+            market="us",
+            base_currency="USD",
+        )
+        account_id = account["id"]
+        self.service.record_trade(
+            account_id=account_id,
+            symbol="TSLA",
+            trade_date=date(2026, 7, 1),
+            side="buy",
+            quantity=3,
+            price=400,
+            market="us",
+            currency="USD",
+        )
+
+        response = self.client.post(
+            "/api/v1/portfolio/imports/csv/commit",
+            data={"account_id": str(account_id), "broker": "schwab", "dry_run": "true"},
+            files={
+                "file": (
+                    "position-statement.csv",
+                    self._schwab_position_csv_bytes(),
+                    "text/csv",
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["dry_run"])
+        self.assertTrue(payload["replace_existing"])
+        self.assertEqual(payload["replaced_trade_count"], 1)
+        self.assertEqual(payload["inserted_count"], 2)
+        trades = self.service.repo.list_trades(account_id, date.max)
+        self.assertEqual([(row.symbol, row.quantity) for row in trades], [("TSLA", 3.0)])
+
+    def test_import_schwab_snapshot_rolls_back_when_replacement_write_fails(self) -> None:
+        account = self.service.create_account(
+            name="Schwab",
+            broker="Schwab",
+            market="us",
+            base_currency="USD",
+        )
+        account_id = account["id"]
+        self.service.record_trade(
+            account_id=account_id,
+            symbol="TSLA",
+            trade_date=date(2026, 7, 1),
+            side="buy",
+            quantity=3,
+            price=400,
+            market="us",
+            currency="USD",
+        )
+        parsed = self.import_service.parse_trade_csv(
+            broker="schwab",
+            content=self._schwab_position_csv_bytes(),
+        )
+
+        with patch.object(
+            self.service.repo,
+            "add_trade_in_session",
+            side_effect=RuntimeError("simulated snapshot write failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated snapshot write failure"):
+                self.import_service.commit_trade_records(
+                    account_id=account_id,
+                    broker="schwab",
+                    records=parsed["records"],
+                    replace_existing=True,
+                )
+
+        trades = self.service.repo.list_trades(account_id, date.max)
+        self.assertEqual([(row.symbol, row.quantity) for row in trades], [("TSLA", 3.0)])
+
+    def test_import_schwab_snapshot_with_parse_errors_keeps_existing_positions(self) -> None:
+        account = self.service.create_account(
+            name="Schwab",
+            broker="Schwab",
+            market="us",
+            base_currency="USD",
+        )
+        account_id = account["id"]
+        self.service.record_trade(
+            account_id=account_id,
+            symbol="TSLA",
+            trade_date=date(2026, 7, 1),
+            side="buy",
+            quantity=3,
+            price=400,
+            market="us",
+            currency="USD",
+        )
+        malformed_snapshot = self._schwab_position_csv_bytes().replace(
+            b"AMZN,+1",
+            b"AMZN,-1",
+            1,
+        )
+
+        response = self.client.post(
+            "/api/v1/portfolio/imports/csv/commit",
+            data={"account_id": str(account_id), "broker": "schwab", "dry_run": "false"},
+            files={
+                "file": (
+                    "position-statement.csv",
+                    malformed_snapshot,
+                    "text/csv",
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        trades = self.service.repo.list_trades(account_id, date.max)
+        self.assertEqual([(row.symbol, row.quantity) for row in trades], [("TSLA", 3.0)])
 
     def test_import_schwab_parse_endpoint_reports_source_duplicates(self) -> None:
         response = self.client.post(

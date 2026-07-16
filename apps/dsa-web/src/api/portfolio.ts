@@ -303,11 +303,13 @@ export const portfolioApi = {
     broker: string,
     file: File,
     dryRun = false,
+    replaceExisting = false,
   ): Promise<PortfolioImportCommitResponse> {
     const formData = new FormData();
     formData.append('account_id', String(accountId));
     formData.append('broker', broker);
     formData.append('dry_run', dryRun ? 'true' : 'false');
+    formData.append('replace_existing', replaceExisting ? 'true' : 'false');
     formData.append('file', file);
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/portfolio/imports/csv/commit', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },

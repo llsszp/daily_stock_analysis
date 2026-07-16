@@ -347,6 +347,9 @@ describe('PortfolioPage FX refresh', () => {
       duplicateCount: 0,
       failedCount: 0,
       dryRun: true,
+      replaceExisting: false,
+      replacedTradeCount: 0,
+      replacedCorporateActionCount: 0,
       errors: [],
     });
     createAccount.mockResolvedValue({ id: 1 });
@@ -1233,6 +1236,69 @@ describe('PortfolioPage FX refresh', () => {
     expect(getSnapshot).toHaveBeenCalledTimes(snapshotCallsAfterSwitch);
     expect(getRisk).toHaveBeenCalledTimes(riskCallsAfterSwitch);
     expect(screen.queryByText('汇率已刷新，共更新 1 对。')).not.toBeInTheDocument();
+  });
+
+  it('defaults Schwab imports to snapshot replacement and preserves alert messaging', async () => {
+    listImportBrokers.mockResolvedValue({
+      brokers: [{ broker: 'schwab', aliases: ['thinkorswim', 'tos'], displayName: '嘉信证券 / thinkorswim' }],
+    });
+    parseCsvImport.mockResolvedValueOnce({
+      broker: 'schwab',
+      recordCount: 2,
+      duplicateCount: 2,
+      skippedCount: 0,
+      errorCount: 0,
+      records: [],
+      errors: [],
+    });
+    commitCsvImport.mockResolvedValueOnce({
+      accountId: 1,
+      recordCount: 2,
+      insertedCount: 2,
+      duplicateCount: 0,
+      failedCount: 0,
+      dryRun: false,
+      replaceExisting: true,
+      replacedTradeCount: 18,
+      replacedCorporateActionCount: 1,
+      errors: [],
+    });
+
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+
+    const accountSelect = screen.getAllByRole('combobox')[0];
+    fireEvent.change(accountSelect, { target: { value: '1' } });
+    const replaceCheckbox = await screen.findByRole('checkbox', {
+      name: '以本次嘉信持仓快照替换当前账户（默认）',
+    });
+    expect(replaceCheckbox).toBeChecked();
+    expect(screen.getByText(/资金流水及全部告警规则都会保留/)).toBeInTheDocument();
+    expect(screen.getByText(/已清仓股票的单股告警也会继续运行/)).toBeInTheDocument();
+
+    const csvFile = new File(['schwab'], 'position-statement.csv', { type: 'text/csv' });
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    fireEvent.change(fileInput!, { target: { files: [csvFile] } });
+    fireEvent.click(screen.getByRole('button', { name: '解析文件' }));
+    await waitFor(() => expect(parseCsvImport).toHaveBeenCalledWith('schwab', csvFile));
+    expect(await screen.findByText(/有效 2 条/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '仅预演（不写入）' }));
+    fireEvent.click(screen.getByRole('button', { name: '提交导入' }));
+    expect(await screen.findByText('替换嘉信账户持仓')).toBeInTheDocument();
+    expect(screen.getByText(/确认以新 CSV 替换.*全部告警规则都会保留/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认替换' }));
+
+    await waitFor(() => expect(commitCsvImport).toHaveBeenCalledWith(
+      1,
+      'schwab',
+      csvFile,
+      false,
+      true,
+    ));
+    expect(await screen.findByText(/已清理旧交易 18 条、公司行为 1 条/)).toBeInTheDocument();
+    expect(screen.getByText(/资金流水和告警规则已保留/)).toBeInTheDocument();
   });
 
   it('deactivates the selected account from the account toolbar and reloads accounts', async () => {

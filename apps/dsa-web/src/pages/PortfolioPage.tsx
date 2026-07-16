@@ -239,8 +239,10 @@ const PortfolioPage: React.FC = () => {
   const [selectedBroker, setSelectedBroker] = useState('huatai');
   const [csvFile, setCsvFile] = useState<File | null>(null);
   const [csvDryRun, setCsvDryRun] = useState(true);
+  const [csvReplaceExisting, setCsvReplaceExisting] = useState(false);
   const [csvParsing, setCsvParsing] = useState(false);
   const [csvCommitting, setCsvCommitting] = useState(false);
+  const [pendingCsvReplacement, setPendingCsvReplacement] = useState(false);
   const [csvParseResult, setCsvParseResult] = useState<PortfolioImportParseResponse | null>(null);
   const [csvCommitResult, setCsvCommitResult] = useState<PortfolioImportCommitResponse | null>(null);
   const [brokerLoadWarning, setBrokerLoadWarning] = useState<string | null>(null);
@@ -296,6 +298,14 @@ const PortfolioPage: React.FC = () => {
   const hasAccounts = accounts.length > 0;
   const writableAccount = selectedAccount === 'all' ? undefined : accounts.find((item) => item.id === selectedAccount);
   const writableAccountId = writableAccount?.id;
+  const isSchwabImport = selectedBroker === 'schwab';
+  const isSchwabReplacement = isSchwabImport && csvReplaceExisting;
+  const schwabReplacementReady = Boolean(
+    csvParseResult
+    && csvParseResult.broker === 'schwab'
+    && csvParseResult.recordCount > 0
+    && csvParseResult.errorCount === 0,
+  );
   const writeBlocked = !writableAccountId;
   const canDeleteSelectedAccount = Boolean(writableAccountId) && !isLoading && !fxRefreshing && !accountDeleteLoading;
   const totalEventPages = Math.max(1, Math.ceil(eventTotal / DEFAULT_PAGE_SIZE));
@@ -352,6 +362,13 @@ const PortfolioPage: React.FC = () => {
         setSelectedBroker(FALLBACK_BROKERS[0].broker);
       }
     }
+  }, [selectedBroker]);
+
+  useEffect(() => {
+    setCsvReplaceExisting(selectedBroker === 'schwab');
+    setCsvParseResult(null);
+    setCsvCommitResult(null);
+    setPendingCsvReplacement(false);
   }, [selectedBroker]);
 
   const loadSnapshotAndRisk = useCallback(async (forceRealtime = false) => {
@@ -803,7 +820,7 @@ const PortfolioPage: React.FC = () => {
     }
   };
 
-  const handleCommitCsv = async () => {
+  const commitCsv = async () => {
     if (!csvFile) return;
     if (!writableAccountId) {
       setWriteWarning('请先在右上角选择具体账户，再进行录入或导入提交。');
@@ -812,7 +829,13 @@ const PortfolioPage: React.FC = () => {
     try {
       setWriteWarning(null);
       setCsvCommitting(true);
-      const committed = await portfolioApi.commitCsvImport(writableAccountId, selectedBroker, csvFile, csvDryRun);
+      const committed = await portfolioApi.commitCsvImport(
+        writableAccountId,
+        selectedBroker,
+        csvFile,
+        csvDryRun,
+        isSchwabReplacement,
+      );
       setCsvCommitResult(committed);
       if (!csvDryRun) {
         await refreshPortfolioData();
@@ -821,7 +844,20 @@ const PortfolioPage: React.FC = () => {
       setError(getParsedApiError(err));
     } finally {
       setCsvCommitting(false);
+      setPendingCsvReplacement(false);
     }
+  };
+
+  const handleCommitCsv = () => {
+    if (isSchwabReplacement && !schwabReplacementReady) {
+      setWriteWarning('嘉信快照替换前请先解析 CSV，并确认至少有一条有效持仓且没有解析错误。');
+      return;
+    }
+    if (isSchwabReplacement && !csvDryRun) {
+      setPendingCsvReplacement(true);
+      return;
+    }
+    void commitCsv();
   };
 
   const openDeleteDialog = (item: PendingDelete) => {
@@ -1639,9 +1675,32 @@ const PortfolioPage: React.FC = () => {
               <label className={PORTFOLIO_FILE_PICKER_CLASS}>
                 选择 CSV
                 <input type="file" accept=".csv" className="hidden"
-                  onChange={(e) => setCsvFile(e.target.files && e.target.files[0] ? e.target.files[0] : null)} />
+                  onChange={(e) => {
+                    setCsvFile(e.target.files && e.target.files[0] ? e.target.files[0] : null);
+                    setCsvParseResult(null);
+                    setCsvCommitResult(null);
+                  }} />
               </label>
             </div>
+            {isSchwabImport ? (
+              <>
+                <div className="flex items-center gap-2 text-xs text-secondary">
+                  <input
+                    id="csv-replace-existing"
+                    type="checkbox"
+                    checked={csvReplaceExisting}
+                    onChange={(e) => setCsvReplaceExisting(e.target.checked)}
+                  />
+                  <label htmlFor="csv-replace-existing">以本次嘉信持仓快照替换当前账户（默认）</label>
+                </div>
+                <InlineAlert
+                  variant="warning"
+                  title="嘉信快照同步"
+                  message={`实际提交时会先清空${writableAccount ? `“${writableAccount.name}”` : '当前选中账户'}的旧交易和公司行为，再写入新持仓；资金流水及全部告警规则都会保留。新表中已清仓股票的单股告警也会继续运行，可在告警模块手工停用。`}
+                  className="rounded-lg px-3 py-2 text-xs shadow-none"
+                />
+              </>
+            ) : null}
             <div className="flex items-center gap-2 text-xs text-secondary">
               <input id="csv-dry-run" type="checkbox" checked={csvDryRun} onChange={(e) => setCsvDryRun(e.target.checked)} />
               <label htmlFor="csv-dry-run">仅预演（不写入）</label>
@@ -1651,7 +1710,13 @@ const PortfolioPage: React.FC = () => {
                 {csvParsing ? '解析中...' : '解析文件'}
               </button>
               <button type="button" className="btn-secondary flex-1"
-                disabled={!csvFile || !writableAccountId || csvCommitting} onClick={() => void handleCommitCsv()}>
+                disabled={
+                  !csvFile
+                  || !writableAccountId
+                  || csvCommitting
+                  || (isSchwabReplacement && !schwabReplacementReady)
+                }
+                onClick={handleCommitCsv}>
                 {csvCommitting ? '提交中...' : '提交导入'}
               </button>
             </div>
@@ -1665,9 +1730,11 @@ const PortfolioPage: React.FC = () => {
             ) : null}
             {csvCommitResult ? (
               <InlineAlert
-                variant={getCsvCommitVariant(csvCommitResult, csvDryRun)}
-                title={csvDryRun ? 'CSV 预演结果' : 'CSV 提交结果'}
-                message={`${csvDryRun ? '预演检查' : '实际写入'}：写入 ${csvCommitResult.insertedCount} 条，重复 ${csvCommitResult.duplicateCount} 条，失败 ${csvCommitResult.failedCount} 条。`}
+                variant={getCsvCommitVariant(csvCommitResult, csvCommitResult.dryRun)}
+                title={csvCommitResult.dryRun ? 'CSV 预演结果' : 'CSV 提交结果'}
+                message={csvCommitResult.replaceExisting
+                  ? `${csvCommitResult.dryRun ? '预演替换' : '快照同步'}：${csvCommitResult.dryRun ? '将清理' : '已清理'}旧交易 ${csvCommitResult.replacedTradeCount} 条、公司行为 ${csvCommitResult.replacedCorporateActionCount} 条，写入新持仓 ${csvCommitResult.insertedCount} 条；资金流水和告警规则已保留。`
+                  : `${csvCommitResult.dryRun ? '预演检查' : '实际写入'}：写入 ${csvCommitResult.insertedCount} 条，重复 ${csvCommitResult.duplicateCount} 条，失败 ${csvCommitResult.failedCount} 条。`}
                 className="rounded-lg px-3 py-2 text-xs shadow-none"
               />
             ) : null}
@@ -1809,6 +1876,20 @@ const PortfolioPage: React.FC = () => {
           </div>
         </Card>
       </section>
+      <ConfirmDialog
+        isOpen={pendingCsvReplacement}
+        title="替换嘉信账户持仓"
+        message={`确认以新 CSV 替换${writableAccount ? `“${writableAccount.name}”` : '当前账户'}的全部持仓吗？旧交易和公司行为会被清除，资金流水不会删除。全部告警规则都会保留；新表中已清仓股票的单股告警仍会继续监控，如不需要请在告警模块停用。`}
+        confirmText={csvCommitting ? '同步中...' : '确认替换'}
+        cancelText="取消"
+        confirmDisabled={csvCommitting}
+        cancelDisabled={csvCommitting}
+        isDanger
+        onConfirm={() => void commitCsv()}
+        onCancel={() => {
+          if (!csvCommitting) setPendingCsvReplacement(false);
+        }}
+      />
       <ConfirmDialog
         isOpen={Boolean(pendingDelete)}
         title="删除错误流水"

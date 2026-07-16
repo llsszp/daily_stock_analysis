@@ -272,8 +272,32 @@ class PortfolioImportService:
         broker: str,
         records: List[Dict[str, Any]],
         dry_run: bool = False,
+        replace_existing: bool = False,
     ) -> Dict[str, Any]:
         broker_norm = self._normalize_broker(broker)
+
+        if replace_existing:
+            if broker_norm != "schwab":
+                raise ValueError("replace_existing is only supported for Schwab position snapshots")
+            replacement = self.portfolio_service.replace_account_position_snapshot(
+                account_id=account_id,
+                records=records,
+                dry_run=dry_run,
+            )
+            return {
+                "account_id": account_id,
+                "record_count": len(records),
+                "inserted_count": int(replacement["inserted_count"]),
+                "duplicate_count": 0,
+                "failed_count": 0,
+                "dry_run": bool(dry_run),
+                "replace_existing": True,
+                "replaced_trade_count": int(replacement["replaced_trade_count"]),
+                "replaced_corporate_action_count": int(
+                    replacement["replaced_corporate_action_count"]
+                ),
+                "errors": [],
+            }
 
         inserted_count = 0
         duplicate_count = 0
@@ -352,6 +376,9 @@ class PortfolioImportService:
             "duplicate_count": duplicate_count,
             "failed_count": failed_count,
             "dry_run": bool(dry_run),
+            "replace_existing": False,
+            "replaced_trade_count": 0,
+            "replaced_corporate_action_count": 0,
             "errors": errors[:20],
         }
 
