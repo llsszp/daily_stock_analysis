@@ -5,11 +5,20 @@ set -u
 PROJECT_DIR="${0:A:h}"
 PORT=8010
 URL="http://127.0.0.1:${PORT}"
+ONLINE_SCREEN="dsa_online_access"
 
 cd "$PROJECT_DIR" || exit 1
 
+start_online_access() {
+  if ! screen -ls 2>/dev/null | grep -q "\.${ONLINE_SCREEN}[[:space:]]"; then
+    screen -dmS "$ONLINE_SCREEN" /bin/zsh -c \
+      "cd '$PROJECT_DIR' && exec ./scripts/run_online_access.sh"
+  fi
+}
+
 if lsof -nP -iTCP:${PORT} -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "DSA 已在 ${URL} 运行，正在打开浏览器。"
+  start_online_access
+  echo "DSA 已在 ${URL} 运行，在线访问服务也已启动。"
   open "$URL"
   exit 0
 fi
@@ -52,6 +61,7 @@ trap 'exit 143' TERM HUP
 (
   for _ in {1..90}; do
     if curl -fsS --max-time 1 "$URL" >/dev/null 2>&1; then
+      start_online_access
       open "$URL"
       exit 0
     fi
