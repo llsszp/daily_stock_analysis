@@ -61,6 +61,7 @@ class RuntimeAlertRule:
     cooldown_policy: Optional[Dict[str, Any]] = None
     effective_target: Optional[str] = None
     display_target: Optional[str] = None
+    rule_name: Optional[str] = None
 
 
 @dataclass
@@ -264,6 +265,7 @@ class AlertWorker:
                             cooldown_policy=cooldown_policy,
                             effective_target=payload.effective_target,
                             display_target=payload.display_target,
+                            rule_name=str(row.name or "").strip() or None,
                         )
                     )
                     seen_keys.add(payload.key)
@@ -679,7 +681,7 @@ class AlertWorker:
         from src.notification import NotificationBuilder, NotificationService
 
         notification_service = self.notifier or NotificationService()
-        title = f"Event Alert | {self._display_target(runtime_rule)}"
+        title = self._notification_title(runtime_rule)
         content = result.get("reason") or result.get("message") or runtime_rule.rule.description or "Alert triggered"
         diagnostics = self._diagnostics_payload(result.get("diagnostics"))
         visibility = diagnostics.get("analysis_visibility") if isinstance(diagnostics.get("analysis_visibility"), dict) else None
@@ -697,7 +699,11 @@ class AlertWorker:
             content = f"{content}\n\n{signal_excerpt}"
         alert_text = NotificationBuilder.build_simple_alert(title=title, content=content, alert_type="warning")
 
-        return notification_service.send_with_results(alert_text, route_type="alert")
+        return notification_service.send_with_results(
+            alert_text,
+            route_type="alert",
+            title=title,
+        )
 
     def _send_notification_safely(self, runtime_rule: RuntimeAlertRule, result: Dict[str, Any]) -> "NotificationDispatchResult":
         try:
@@ -922,6 +928,37 @@ class AlertWorker:
     @staticmethod
     def _display_target(runtime_rule: RuntimeAlertRule) -> str:
         return str(runtime_rule.display_target or runtime_rule.effective_target or getattr(runtime_rule.rule, "stock_code", "") or "?")
+
+    @classmethod
+    def _notification_title(cls, runtime_rule: RuntimeAlertRule) -> str:
+        target = cls._display_target(runtime_rule).strip() or "标的"
+        rule_name = str(getattr(runtime_rule, "rule_name", None) or "").strip()
+        if rule_name:
+            event_name = rule_name if target.casefold() in rule_name.casefold() else f"{target} · {rule_name}"
+            if event_name.endswith(("触发", "告警", "提醒")):
+                return event_name
+            return f"{event_name}触发"
+
+        raw_alert_type = getattr(runtime_rule.rule, "alert_type", "")
+        alert_type = str(getattr(raw_alert_type, "value", raw_alert_type) or "").strip().lower()
+        labels = {
+            "price_cross": "价格越线",
+            "price_change_percent": "涨跌幅",
+            "trailing_stop": "跟踪止损",
+            "volume_spike": "成交量放大",
+            "ma_price_cross": "均线突破",
+            "rsi_threshold": "RSI 阈值",
+            "macd_cross": "MACD 交叉",
+            "kdj_cross": "KDJ 交叉",
+            "cci_threshold": "CCI 阈值",
+            "portfolio_stop_loss": "持仓止损",
+            "portfolio_concentration": "持仓集中度",
+            "portfolio_drawdown": "持仓回撤",
+            "portfolio_price_stale": "持仓价格过期",
+            "market_light_status": "市场信号灯",
+            "market_light_score_drop": "市场评分下降",
+        }
+        return f"{target} {labels.get(alert_type, '告警')}触发"
 
     @staticmethod
     def _cooldown_seconds(runtime_rule: RuntimeAlertRule) -> int:

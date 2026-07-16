@@ -2229,6 +2229,10 @@ class TestEventMonitorConfigIntegration(unittest.TestCase):
         notifier.send.assert_called_once()
         self.assertIn("hit", notifier.send.call_args.args[0])
         self.assertEqual(notifier.send.call_args.kwargs["route_type"], "alert")
+        self.assertEqual(
+            notifier.send.call_args.kwargs["title"],
+            "600519 价格越线触发",
+        )
 
     def test_build_event_monitor_from_config_accepts_price_change_percent(self):
         from src.agent.events import PriceChangeAlert, build_event_monitor_from_config

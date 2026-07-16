@@ -217,6 +217,23 @@ class TestNotificationServiceSendToMethods(unittest.TestCase):
         self.assertTrue(by_channel["custom"].success)
 
     @mock.patch("src.notification.get_config")
+    def test_send_with_results_passes_event_title_to_dingtalk(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(
+            dingtalk_webhook_url="https://oapi.dingtalk.com/robot/send?access_token=test",
+        )
+        service = NotificationService()
+
+        with mock.patch.object(service, "send_to_dingtalk", return_value=True) as mock_dingtalk:
+            result = service.send_with_results(
+                "alert content",
+                route_type="alert",
+                title="QQQ 跟踪止损触发",
+            )
+
+        self.assertTrue(result.success)
+        mock_dingtalk.assert_called_once_with("alert content", title="QQQ 跟踪止损触发")
+
+    @mock.patch("src.notification.get_config")
     def test_send_with_results_reports_route_no_channel(self, mock_get_config: mock.MagicMock):
         cfg = _make_config(
             custom_webhook_urls=["https://example.com/webhook"],

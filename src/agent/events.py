@@ -558,10 +558,18 @@ def build_event_monitor_from_config(config=None, notifier=None) -> Optional[Even
     notification_service = notifier or NotificationService()
 
     def _notify(triggered: TriggeredAlert) -> None:
-        title = f"Event Alert | {triggered.rule.stock_code}"
+        raw_alert_type = getattr(triggered.rule, "alert_type", "")
+        alert_type = str(getattr(raw_alert_type, "value", raw_alert_type) or "").strip().lower()
+        event_label = {
+            "price_cross": "价格越线",
+            "price_change_percent": "涨跌幅",
+            "volume_spike": "成交量放大",
+            "sentiment_shift": "情绪变化",
+        }.get(alert_type, "告警")
+        title = f"{triggered.rule.stock_code} {event_label}触发"
         content = triggered.message or triggered.rule.description or "Alert triggered"
         alert_text = NotificationBuilder.build_simple_alert(title=title, content=content, alert_type="warning")
-        sent = notification_service.send(alert_text, route_type="alert")
+        sent = notification_service.send(alert_text, route_type="alert", title=title)
         if not sent:
             logger.info("[EventMonitor] No notification channel available for alert: %s", title)
 

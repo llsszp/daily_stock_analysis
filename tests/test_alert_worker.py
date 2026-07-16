@@ -318,6 +318,33 @@ class AlertWorkerTestCase(unittest.TestCase):
             notifier.send_with_results.side_effect = list(results)
         return notifier
 
+    def test_notification_uses_persisted_rule_name_as_dingtalk_title(self) -> None:
+        self._create_rule(
+            name="QQQ 跟踪止损",
+            target="QQQ",
+            alert_type="trailing_stop",
+            parameters={
+                "activation_price": 725.82,
+                "trail_mode": "amount",
+                "trail_value": 5,
+            },
+        )
+        notifier = self._notifier()
+        worker = AlertWorker(
+            config_provider=lambda: self._config(),
+            service=self.service,
+            notifier=notifier,
+        )
+        runtime_rule = worker._load_runtime_rules(self._config())[0]
+
+        worker._send_notification(runtime_rule, {"reason": "QQQ 跟踪止损已触发"})
+
+        notifier.send_with_results.assert_called_once()
+        self.assertEqual(
+            notifier.send_with_results.call_args.kwargs["title"],
+            "QQQ 跟踪止损触发",
+        )
+
     def test_trailing_stop_persists_peak_and_triggers_on_percent_drawdown(self) -> None:
         created = self._create_rule(
             name="AAPL trailing stop",

@@ -2408,6 +2408,7 @@ class NotificationService(
         channel: NotificationChannel,
         content: str,
         *,
+        title: Optional[str],
         image_bytes: Optional[bytes],
         email_stock_codes: Optional[List[str]],
         email_send_to_all: bool,
@@ -2427,7 +2428,7 @@ class NotificationService(
                 return self.send_feishu_file(filepath)
             return self.send_to_feishu(content)
         if channel == NotificationChannel.DINGTALK:
-            return self.send_to_dingtalk(content)
+            return self.send_to_dingtalk(content, title=title or "")
         if channel == NotificationChannel.TELEGRAM:
             if use_image:
                 return self._send_telegram_photo(image_bytes)
@@ -2475,6 +2476,7 @@ class NotificationService(
         severity: Optional[str] = None,
         dedup_key: Optional[str] = None,
         cooldown_key: Optional[str] = None,
+        title: Optional[str] = None,
     ) -> NotificationDispatchResult:
         """
         Send a notification and return per-channel diagnostics.
@@ -2495,6 +2497,7 @@ class NotificationService(
             severity: 通知严重级别；未设置时按路由类型推断
             dedup_key: 可选稳定去重 key；未设置时使用内容 hash
             cooldown_key: 可选冷却 key；未设置时使用路由/级别默认 key
+            title: 可选通知标题；钉钉 Markdown 消息会显示该标题
 
         Returns:
             Structured dispatch diagnostics.
@@ -2624,6 +2627,7 @@ class NotificationService(
                 result = self._send_to_static_channel(
                     channel,
                     content,
+                    title=title,
                     image_bytes=image_bytes,
                     email_stock_codes=email_stock_codes,
                     email_send_to_all=email_send_to_all,
@@ -2689,6 +2693,7 @@ class NotificationService(
         severity: Optional[str] = None,
         dedup_key: Optional[str] = None,
         cooldown_key: Optional[str] = None,
+        title: Optional[str] = None,
     ) -> bool:
         """
         统一发送接口 - 向所有已配置的渠道发送。
@@ -2704,6 +2709,7 @@ class NotificationService(
             severity=severity,
             dedup_key=dedup_key,
             cooldown_key=cooldown_key,
+            title=title,
         )
         return bool(result.success)
 
