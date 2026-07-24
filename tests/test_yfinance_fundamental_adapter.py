@@ -52,6 +52,39 @@ class TestYfinanceSymbolConversion(unittest.TestCase):
 
 
 class TestYfinanceFundamentalAdapter(unittest.TestCase):
+    def test_surfaces_latest_reported_earnings_event_before_statements_refresh(self) -> None:
+        ticker = _build_mock_ticker(
+            {"financialCurrency": "USD", "currency": "USD"},
+            income_stmt=pd.DataFrame(
+                {
+                    pd.Timestamp("2026-03-31"): {
+                        "Total Revenue": 13.577e9,
+                        "Net Income": -3.728e9,
+                    }
+                }
+            ),
+        )
+        ticker.get_earnings_dates.return_value = pd.DataFrame(
+            {
+                "EPS Estimate": [0.22, 0.01],
+                "Reported EPS": [0.42, 0.29],
+                "Surprise(%)": [92.49, 2108.68],
+            },
+            index=pd.DatetimeIndex(
+                ["2026-07-23 16:00:00-04:00", "2026-04-23 16:00:00-04:00"]
+            ),
+        )
+
+        with patch("yfinance.Ticker", return_value=ticker):
+            bundle = YfinanceFundamentalAdapter().get_fundamental_bundle("INTC")
+
+        event = bundle["earnings"]["latest_earnings_event"]
+        self.assertEqual(event["event_date"], "2026-07-23")
+        self.assertEqual(event["reported_eps"], 0.42)
+        self.assertEqual(event["eps_estimate"], 0.22)
+        self.assertEqual(event["surprise_pct"], 92.49)
+        self.assertIn("earnings.latest_event:yfinance", bundle["source_chain"])
+
     def test_populates_growth_earnings_dividend_boards_for_us_stock(self) -> None:
         info = {
             "financialCurrency": "USD",

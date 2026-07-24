@@ -3864,27 +3864,54 @@ class GeminiAnalyzer:
             if isinstance(earnings_data, dict)
             else {}
         )
+        latest_earnings_event = (
+            earnings_data.get("latest_earnings_event", {})
+            if isinstance(earnings_data, dict)
+            else {}
+        )
         if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
+            latest_earnings_event = (
+                latest_earnings_event if isinstance(latest_earnings_event, dict) else {}
+            )
             ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
             ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
             ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
             report_date = financial_report.get("report_date", "N/A")
+            financial_currency = financial_report.get("currency")
+            event_date = latest_earnings_event.get("event_date", "N/A")
+            event_is_newer = (
+                isinstance(event_date, str)
+                and isinstance(report_date, str)
+                and event_date != "N/A"
+                and report_date != "N/A"
+                and event_date > report_date
+            )
+            event_note = (
+                "晚于结构化报告期，优先视为最新业绩事件"
+                if event_is_newer
+                else "来自业绩日历"
+            )
             prompt += f"""
 ### 财报与分红（价值投资口径）
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | 最近报告期 | {report_date} | 来自结构化财报字段 |
-| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
-| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
-| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
+| 营业收入 | {self._format_financial_statement_amount(financial_report.get('revenue'), financial_currency, report_language)} | |
+| 归母净利润 | {self._format_financial_statement_amount(financial_report.get('net_profit_parent'), financial_currency, report_language)} | |
+| 经营现金流 | {self._format_financial_statement_amount(financial_report.get('operating_cash_flow'), financial_currency, report_language)} | |
 | ROE | {financial_report.get('roe', 'N/A')} | |
+| 最近业绩发布日期 | {event_date} | {event_note} |
+| 最新实际 EPS | {latest_earnings_event.get('reported_eps', 'N/A')} | |
+| 市场预期 EPS | {latest_earnings_event.get('eps_estimate', 'N/A')} | |
+| EPS 惊喜幅度 | {latest_earnings_event.get('surprise_pct', 'N/A')}% | |
 | 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
 | TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
 | TTM 分红事件数 | {ttm_count} | |
 
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
+> 若“最近业绩发布日期”晚于“最近报告期”，表示业绩刚发布但完整结构化报表尚未同步。此时必须优先结合最新业绩事件与近期限内新闻，不得把旧报告期称为刚公布的财报。
 """
 
         capital_flow_block = (
@@ -4245,6 +4272,42 @@ class GeminiAnalyzer:
             return f"{amount / 1e4:.2f} 万元"
         else:
             return f"{amount:.0f} 元"
+
+    @staticmethod
+    def _format_financial_statement_amount(
+        value: Any,
+        currency: Any,
+        report_language: str = "zh",
+    ) -> str:
+        """Render statement amounts with an explicit scale and currency."""
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if amount != amount:
+            return "N/A"
+        currency_code = str(currency or "").strip().upper()
+        language = normalize_report_language(report_language)
+        if language == "zh":
+            currency_labels = {
+                "USD": "美元",
+                "HKD": "港元",
+                "CNY": "元",
+                "JPY": "日元",
+                "KRW": "韩元",
+                "TWD": "新台币",
+                "EUR": "欧元",
+                "GBP": "英镑",
+            }
+            label = currency_labels.get(currency_code, currency_code)
+            if abs(amount) >= 1e8:
+                return f"{amount / 1e8:.2f} 亿{label}".strip()
+            return f"{amount:.2f} {label}".strip()
+        if abs(amount) >= 1e9:
+            return f"{amount / 1e9:.3f} billion {currency_code}".strip()
+        if abs(amount) >= 1e6:
+            return f"{amount / 1e6:.3f} million {currency_code}".strip()
+        return f"{amount:.2f} {currency_code}".strip()
 
     def _format_recent_intraday_price_action_prompt(
         self,

@@ -2644,6 +2644,20 @@ class SearchService:
             return [self._yahoo_finance_provider, *providers]
         return providers
 
+    @staticmethod
+    def _yahoo_intel_query(stock_code: str, dimension_name: str) -> str:
+        """Keep Yahoo queries compact; verbose natural-language queries return no news."""
+        code = (stock_code or "").strip().upper()
+        suffixes = {
+            "latest_news": "",
+            "market_analysis": "analyst rating",
+            "risk_check": "risk",
+            "earnings": "earnings",
+            "industry": "industry outlook",
+        }
+        suffix = suffixes.get(dimension_name, "")
+        return f"{code} {suffix}".strip()
+
     def _cache_key(self, query: str, max_results: int, days: int) -> str:
         """Build a cache key from query parameters."""
         return f"{query}|{max_results}|{days}"
@@ -4304,13 +4318,25 @@ class SearchService:
             if search_count >= max_searches:
                 break
             
-            # 选择搜索引擎（轮流使用）
+            # Foreign-stock analysis prefers keyless Yahoo news for every
+            # dimension. Its endpoint works best with compact ticker queries.
             available_providers = [p for p in self._providers if p.is_available]
-            if not available_providers:
+            yahoo_provider = (
+                self._yahoo_finance_provider
+                if is_foreign
+                and self._yahoo_finance_provider is not None
+                and self._yahoo_finance_provider.is_available
+                else None
+            )
+            if not available_providers and yahoo_provider is None:
                 break
-            
-            provider = available_providers[provider_index % len(available_providers)]
-            provider_index += 1
+            if yahoo_provider is not None:
+                provider = yahoo_provider
+                provider_query = self._yahoo_intel_query(stock_code, dim["name"])
+            else:
+                provider = available_providers[provider_index % len(available_providers)]
+                provider_index += 1
+                provider_query = dim["query"]
             
             request_days = (
                 self.ANALYTICAL_INTEL_LOOKBACK_DAYS
@@ -4334,7 +4360,7 @@ class SearchService:
                 )
             else:
                 response = provider.search(
-                    dim['query'],
+                    provider_query,
                     max_results=provider_max_results,
                     days=request_days,
                 )

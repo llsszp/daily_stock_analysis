@@ -266,6 +266,37 @@ class YfinanceFundamentalAdapter:
             result.setdefault("earnings", {})["financial_report"] = financial_report
             result["source_chain"].append("earnings.financial_report:yfinance")
 
+        # Earnings calendars update faster than full statement tables after a
+        # release. Surface the latest reported event so callers can distinguish
+        # a just-published result from lagging quarterly statement fields.
+        latest_earnings_event: Dict[str, Any] = {}
+        try:
+            earnings_dates = ticker.get_earnings_dates(limit=8)
+        except Exception as exc:
+            result["errors"].append(f"earnings_dates:{type(exc).__name__}")
+            earnings_dates = None
+        if isinstance(earnings_dates, pd.DataFrame) and not earnings_dates.empty:
+            try:
+                earnings_dates = earnings_dates.sort_index(ascending=False)
+                for event_ts, event_row in earnings_dates.iterrows():
+                    reported_eps = _safe_float(event_row.get("Reported EPS"))
+                    if reported_eps is None:
+                        continue
+                    event_date = pd.Timestamp(event_ts).date().isoformat()
+                    latest_earnings_event = {
+                        "event_date": event_date,
+                        "eps_estimate": _safe_float(event_row.get("EPS Estimate")),
+                        "reported_eps": reported_eps,
+                        "surprise_pct": _safe_float(event_row.get("Surprise(%)")),
+                        "source": "yfinance.earnings_dates",
+                    }
+                    break
+            except Exception as exc:
+                result["errors"].append(f"earnings_dates_parse:{type(exc).__name__}")
+        if latest_earnings_event:
+            result.setdefault("earnings", {})["latest_earnings_event"] = latest_earnings_event
+            result["source_chain"].append("earnings.latest_event:yfinance")
+
         # ---------------- dividend block ----------------
         events: List[Dict[str, Any]] = []
         try:

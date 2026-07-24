@@ -197,6 +197,48 @@ class AnalyzerNewsPromptTestCase(unittest.TestCase):
         self.assertIn("财报与分红（价值投资口径）", prompt)
         self.assertIn("禁止编造", prompt)
 
+    def test_prompt_marks_new_earnings_event_when_statement_table_lags(self) -> None:
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        context = {
+            "code": "INTC",
+            "stock_name": "英特尔",
+            "date": "2026-07-24",
+            "today": {},
+            "fundamental_context": {
+                "earnings": {
+                    "data": {
+                        "financial_report": {
+                            "report_date": "2026-03-31",
+                            "revenue": 13.577e9,
+                            "net_profit_parent": -3.728e9,
+                            "operating_cash_flow": 1.096e9,
+                            "currency": "USD",
+                        },
+                        "latest_earnings_event": {
+                            "event_date": "2026-07-23",
+                            "eps_estimate": 0.22,
+                            "reported_eps": 0.42,
+                            "surprise_pct": 92.49,
+                        },
+                    }
+                }
+            },
+        }
+        fake_cfg = SimpleNamespace(news_max_age_days=3, news_strategy_profile="short")
+
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            prompt = analyzer._format_prompt(context, "英特尔", news_context="news")
+
+        self.assertIn("135.77 亿美元", prompt)
+        self.assertIn("-37.28 亿美元", prompt)
+        self.assertIn("最近业绩发布日期 | 2026-07-23", prompt)
+        self.assertIn("最新实际 EPS | 0.42", prompt)
+        self.assertIn("市场预期 EPS | 0.22", prompt)
+        self.assertIn("晚于结构化报告期，优先视为最新业绩事件", prompt)
+        self.assertIn("不得把旧报告期称为刚公布的财报", prompt)
+
     def test_prompt_includes_capital_flow_as_operation_filter(self) -> None:
         with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
             analyzer = GeminiAnalyzer()

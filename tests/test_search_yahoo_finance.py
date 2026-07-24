@@ -4,7 +4,12 @@
 import unittest
 from unittest.mock import patch
 
-from src.search_service import SearchService, YahooFinanceNewsProvider
+from src.search_service import (
+    SearchResponse,
+    SearchResult,
+    SearchService,
+    YahooFinanceNewsProvider,
+)
 
 
 class TestYahooFinanceNewsProvider(unittest.TestCase):
@@ -69,8 +74,6 @@ class TestYahooFinanceNewsProvider(unittest.TestCase):
 
     @patch.object(YahooFinanceNewsProvider, "search")
     def test_stock_news_uses_compact_symbol_query_for_yahoo(self, mock_search):
-        from src.search_service import SearchResponse
-
         mock_search.return_value = SearchResponse(
             query="AAPL Apple",
             results=[],
@@ -85,6 +88,39 @@ class TestYahooFinanceNewsProvider(unittest.TestCase):
         service.search_stock_news("AAPL", "Apple", max_results=3)
 
         self.assertEqual(mock_search.call_args.args[0], "AAPL Apple")
+
+    @patch.object(YahooFinanceNewsProvider, "search")
+    def test_comprehensive_intel_uses_compact_yahoo_queries_for_us_stock(self, mock_search):
+        mock_search.side_effect = lambda query, **_kwargs: SearchResponse(
+            query=query,
+            results=[
+                SearchResult(
+                    title=f"Intel INTC {query} update",
+                    snippet="INTC reported a company update.",
+                    url=f"https://example.com/{query.replace(' ', '-')}",
+                    source="Example",
+                    published_date="2026-07-23",
+                )
+            ],
+            provider="YahooFinance",
+            success=True,
+        )
+        service = SearchService(
+            tavily_keys=["exhausted-key"],
+            searxng_public_instances_enabled=False,
+            yahoo_finance_news_enabled=True,
+            news_max_age_days=3,
+        )
+
+        results = service.search_comprehensive_intel("INTC", "英特尔", max_searches=4)
+
+        queries = [call.args[0] for call in mock_search.call_args_list]
+        self.assertEqual(
+            queries,
+            ["INTC", "INTC analyst rating", "INTC risk", "INTC earnings"],
+        )
+        self.assertEqual(results["latest_news"].provider, "YahooFinance")
+        self.assertEqual(results["earnings"].provider, "YahooFinance")
 
 
 if __name__ == "__main__":
