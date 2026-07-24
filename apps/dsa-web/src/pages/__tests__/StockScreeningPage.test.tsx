@@ -1376,6 +1376,13 @@ describe('StockScreeningPage', () => {
           dsaNews: [{ title: '贵州茅台最新公告', source: '测试源' }],
           dsaContext: {
             enriched: true,
+            socialSentiment: {
+              available: true,
+              availableSources: ['reddit'],
+              platforms: {
+                reddit: { sentimentScore: 0.24, buzzScore: 82, mentions: 340 },
+              },
+            },
             warnings: ['stock_news_unavailable'],
           },
           raw: {},
@@ -1400,6 +1407,8 @@ describe('StockScreeningPage', () => {
     expect(screen.getByText(/DSA行情：现价 1688/)).toBeInTheDocument();
     expect(screen.getByText('DSA 新闻')).toBeInTheDocument();
     expect(screen.getByText('贵州茅台最新公告')).toBeInTheDocument();
+    expect(screen.getByText('DSA 舆情')).toBeInTheDocument();
+    expect(screen.getByText(/Reddit · 情绪 0.24 · 热度 82 · 提及 340/)).toBeInTheDocument();
     expect(screen.getByText('DSA 增强提示')).toBeInTheDocument();
     expect(screen.getByText('stock_news_unavailable')).toBeInTheDocument();
   });

@@ -188,11 +188,8 @@ class SocialSentimentService:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def get_social_context(self, ticker: str) -> Optional[str]:
-        """
-        Fetch social sentiment from all platforms and return a formatted
-        text block for the LLM prompt.  Returns None if no data found.
-        """
+    def get_social_snapshot(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Fetch prompt text plus compact, UI-friendly sentiment metrics."""
         if not self.is_available:
             return None
 
@@ -217,7 +214,25 @@ class SocialSentimentService:
         if not reddit_data and not x_entry and not poly_entry:
             return None
 
-        return self._format_social_intel(ticker_upper, reddit_data, x_entry, poly_entry)
+        reddit_report = reddit_data.get("report", reddit_data) if isinstance(reddit_data, dict) else None
+        platforms = {
+            "reddit": self._compact_social_metrics(reddit_report),
+            "x": self._compact_social_metrics(x_entry),
+            "polymarket": self._compact_social_metrics(poly_entry),
+        }
+        available_sources = [name for name, metrics in platforms.items() if metrics]
+        return {
+            "ticker": ticker_upper,
+            "source": "api.adanos.org",
+            "available_sources": available_sources,
+            "platforms": platforms,
+            "context": self._format_social_intel(ticker_upper, reddit_data, x_entry, poly_entry),
+        }
+
+    def get_social_context(self, ticker: str) -> Optional[str]:
+        """Return the social-intelligence text block used by LLM prompts."""
+        snapshot = self.get_social_snapshot(ticker)
+        return str(snapshot.get("context")) if snapshot and snapshot.get("context") else None
 
     # ------------------------------------------------------------------
     # Formatting
@@ -239,6 +254,24 @@ class SocialSentimentService:
             if v is not None:
                 return v
         return None
+
+    @staticmethod
+    def _compact_social_metrics(payload: Optional[Dict]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        metrics = {
+            "buzz_score": SocialSentimentService._coalesce(
+                payload.get("buzz_score"), payload.get("buzz")
+            ),
+            "sentiment_score": SocialSentimentService._coalesce(
+                payload.get("sentiment_score"), payload.get("sentiment")
+            ),
+            "mentions": SocialSentimentService._coalesce(
+                payload.get("total_mentions"), payload.get("mentions")
+            ),
+            "trend": payload.get("trend"),
+        }
+        return {key: value for key, value in metrics.items() if value is not None and value != ""}
 
     @staticmethod
     def _format_social_intel(

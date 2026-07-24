@@ -285,6 +285,115 @@ class BaseSearchProvider(ABC):
         return self._execute_search(query, max_results=max_results, days=days)
 
 
+class YahooFinanceNewsProvider(BaseSearchProvider):
+    """Keyless market-news search backed by yfinance's Yahoo Search API."""
+
+    def __init__(self):
+        # BaseSearchProvider uses a key for shared accounting. This sentinel is
+        # local only; Yahoo Search itself does not require an API key.
+        super().__init__(["keyless"], "YahooFinance")
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+    ) -> SearchResponse:
+        del api_key, days
+        try:
+            import yfinance as yf
+        except ImportError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="yfinance 未安装",
+            )
+
+        try:
+            payload = yf.Search(
+                query,
+                news_count=max(5, max_results),
+                timeout=10,
+            ).news or []
+        except Exception as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=str(exc),
+            )
+
+        results: List[SearchResult] = []
+        seen_urls: set[str] = set()
+        for raw_item in payload:
+            if not isinstance(raw_item, dict):
+                continue
+            content = raw_item.get("content") if isinstance(raw_item.get("content"), dict) else {}
+            title = str(content.get("title") or raw_item.get("title") or "").strip()
+            summary = str(
+                content.get("summary")
+                or content.get("description")
+                or raw_item.get("summary")
+                or raw_item.get("description")
+                or ""
+            ).strip()
+            canonical = content.get("canonicalUrl") if isinstance(content.get("canonicalUrl"), dict) else {}
+            click_through = content.get("clickThroughUrl") if isinstance(content.get("clickThroughUrl"), dict) else {}
+            url = str(
+                canonical.get("url")
+                or click_through.get("url")
+                or raw_item.get("link")
+                or raw_item.get("url")
+                or ""
+            ).strip()
+            if not title or not url or url in seen_urls:
+                continue
+
+            provider_data = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+            source = str(
+                provider_data.get("displayName")
+                or raw_item.get("publisher")
+                or urlparse(url).netloc
+                or self.name
+            ).strip()
+            published_date = content.get("pubDate") or raw_item.get("published_date")
+            if not published_date:
+                epoch = raw_item.get("providerPublishTime")
+                try:
+                    if epoch is not None:
+                        published_date = datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OSError):
+                    published_date = None
+
+            related = raw_item.get("relatedTickers") or content.get("relatedTickers") or []
+            if not summary and isinstance(related, list) and related:
+                summary = f"Related tickers: {', '.join(str(item) for item in related[:8])}"
+
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=summary[:500],
+                    url=url,
+                    source=source,
+                    published_date=str(published_date) if published_date else None,
+                )
+            )
+            seen_urls.add(url)
+            if len(results) >= max_results:
+                break
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+        )
+
+
 class TavilySearchProvider(BaseSearchProvider):
     """
     Tavily 搜索引擎
@@ -2276,6 +2385,7 @@ class SearchService:
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
+        yahoo_finance_news_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2291,10 +2401,12 @@ class SearchService:
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            yahoo_finance_news_enabled: 是否为美股/港股启用免密钥 Yahoo Finance 新闻源
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
         self._providers: List[BaseSearchProvider] = []
+        self._yahoo_finance_provider = YahooFinanceNewsProvider() if yahoo_finance_news_enabled else None
         self.news_max_age_days = max(1, news_max_age_days)
         raw_profile = (news_strategy_profile or "short").strip().lower()
         self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
@@ -2355,7 +2467,9 @@ class SearchService:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
             
-        if not self._providers:
+        if not self._providers and self._yahoo_finance_provider is not None:
+            logger.info("未配置通用搜索渠道；美股仍可使用 Yahoo Finance 免密钥新闻源")
+        elif not self._providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
 
         # In-memory search result cache: {cache_key: (timestamp, SearchResponse)}
@@ -2514,7 +2628,21 @@ class SearchService:
     @property
     def is_available(self) -> bool:
         """检查是否有可用的搜索引擎"""
-        return any(p.is_available for p in self._providers)
+        yahoo_available = bool(
+            self._yahoo_finance_provider is not None and self._yahoo_finance_provider.is_available
+        )
+        return yahoo_available or any(p.is_available for p in self._providers)
+
+    def _stock_news_providers(self, stock_code: str) -> List[BaseSearchProvider]:
+        """Prefer the keyless market-news source for foreign stocks only."""
+        providers = [provider for provider in self._providers if provider.is_available]
+        if (
+            self._is_foreign_stock(stock_code)
+            and self._yahoo_finance_provider is not None
+            and self._yahoo_finance_provider.is_available
+        ):
+            return [self._yahoo_finance_provider, *providers]
+        return providers
 
     def _cache_key(self, query: str, max_results: int, days: int) -> str:
         """Build a cache key from query parameters."""
@@ -3700,9 +3828,7 @@ class SearchService:
             best_ranked_response: Optional[SearchResponse] = None
             best_ranked_stats: Optional[Dict[str, int]] = None
             provider_attempts: List[Dict[str, Any]] = []
-            for provider in self._providers:
-                if not provider.is_available:
-                    continue
+            for provider in self._stock_news_providers(stock_code):
 
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
@@ -3722,7 +3848,17 @@ class SearchService:
                         provider=provider.name,
                         operation="search_stock_news",
                     )
-                    response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
+                    provider_query = (
+                        f"{stock_code} {stock_name}"
+                        if isinstance(provider, YahooFinanceNewsProvider)
+                        else query
+                    )
+                    response = provider.search(
+                        provider_query,
+                        provider_max_results,
+                        days=search_days,
+                        **search_kwargs,
+                    )
                 except Exception as exc:
                     self._record_news_search_run(
                         provider=provider.name,
@@ -4545,6 +4681,7 @@ def get_search_service() -> SearchService:
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    yahoo_finance_news_enabled=getattr(config, "yahoo_finance_news_enabled", True),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

@@ -240,6 +240,33 @@ class TestGetSocialContext(unittest.TestCase):
         self.assertIn("65", result)  # X buzz
         self.assertIn("120", result)  # Polymarket trades
 
+    def test_snapshot_returns_compact_metrics_for_screening_ui(self):
+        svc = SocialSentimentService(api_key="sk_live_test")
+        with (
+            patch.object(
+                svc,
+                "fetch_reddit_report",
+                return_value={
+                    "report": {
+                        "buzz_score": 82,
+                        "sentiment_score": 0.24,
+                        "total_mentions": 340,
+                        "trend": "rising",
+                    }
+                },
+            ),
+            patch.object(svc, "fetch_x_trending", return_value=[]),
+            patch.object(svc, "fetch_polymarket_trending", return_value=[]),
+        ):
+            snapshot = svc.get_social_snapshot("aapl")
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["ticker"], "AAPL")
+        self.assertEqual(snapshot["available_sources"], ["reddit"])
+        self.assertEqual(snapshot["platforms"]["reddit"]["sentiment_score"], 0.24)
+        self.assertEqual(snapshot["platforms"]["reddit"]["mentions"], 340)
+        self.assertIn("Social Sentiment Intelligence", snapshot["context"])
+
 
 class TestZeroValueHandling(unittest.TestCase):
     """Verify that zero-valued numeric fields (e.g. neutral sentiment) are preserved."""

@@ -26,7 +26,7 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
 from src.auth import COOKIE_NAME, is_auth_enabled, refresh_auth_state, verify_session
-from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, get_configured_llm_models
+from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, get_config, get_configured_llm_models
 from src.llm.local_cli_backend import redact_diagnostic_text
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,8 @@ DSA_ALPHASIFT_HOTSPOT_CONNECTIVITY_ERROR_MARKERS = (
 )
 _DSA_FETCHER_MANAGER_LOCK = threading.RLock()
 _DSA_FETCHER_MANAGER: Any = None
+_DSA_SOCIAL_SENTIMENT_SERVICE_LOCK = threading.RLock()
+_DSA_SOCIAL_SENTIMENT_SERVICE: Any = None
 _FUNDAMENTAL_BLOCKS = ("valuation", "growth", "earnings", "institution", "capital_flow", "boards")
 DSA_US_DEFAULT_UNIVERSE = (
     "AAPL",
@@ -2182,6 +2184,11 @@ def _build_dsa_candidate_ai_score_context(
         if isinstance(item, dict)
     ]
     factor_scores = candidate.get("factor_scores") if isinstance(candidate.get("factor_scores"), dict) else {}
+    social_sentiment = (
+        dsa_context.get("social_sentiment")
+        if isinstance(dsa_context.get("social_sentiment"), dict)
+        else {}
+    )
     return _remove_non_finite_json_values({
         "strategy": strategy,
         "market": market,
@@ -2211,6 +2218,7 @@ def _build_dsa_candidate_ai_score_context(
         "daily_calibration": daily,
         "recent_24h": intraday_summary,
         "news": compact_news,
+        "social_sentiment": social_sentiment,
     })
 
 
@@ -5471,6 +5479,21 @@ def _get_dsa_search_service() -> Any:
     return get_search_service()
 
 
+def _get_dsa_social_sentiment_service() -> Any:
+    global _DSA_SOCIAL_SENTIMENT_SERVICE
+    if _DSA_SOCIAL_SENTIMENT_SERVICE is None:
+        with _DSA_SOCIAL_SENTIMENT_SERVICE_LOCK:
+            if _DSA_SOCIAL_SENTIMENT_SERVICE is None:
+                from src.services.social_sentiment_service import SocialSentimentService
+
+                config = get_config()
+                _DSA_SOCIAL_SENTIMENT_SERVICE = SocialSentimentService(
+                    api_key=config.social_sentiment_api_key,
+                    api_url=config.social_sentiment_api_url,
+                )
+    return _DSA_SOCIAL_SENTIMENT_SERVICE
+
+
 def get_dsa_daily_history(stock_code: str, *, lookback_days: int = 120) -> Tuple[Any, str]:
     from src.services.history_loader import load_history_df
 
@@ -5777,6 +5800,11 @@ def _build_dsa_candidate_context(
     )
     existing_news = existing_context.get("news") if isinstance(existing_context.get("news"), dict) else {}
     news: Dict[str, Any] = dict(existing_news) if existing_news else {"success": False, "results": []}
+    social_sentiment = (
+        existing_context.get("social_sentiment")
+        if isinstance(existing_context.get("social_sentiment"), dict)
+        else {}
+    )
     existing_warnings = existing_context.get("warnings") or []
     if isinstance(existing_warnings, list):
         warnings.extend(str(item) for item in existing_warnings if item)
@@ -5833,14 +5861,46 @@ def _build_dsa_candidate_context(
             "results": [],
         }
 
-    summary = _build_dsa_analysis_summary(candidate, quote, fundamentals, news)
+    if include_news and re.fullmatch(r"[A-Z]{1,5}(?:[.-][A-Z])?", code.upper()) and not social_sentiment:
+        try:
+            social_service = _get_dsa_social_sentiment_service()
+            if getattr(social_service, "is_available", False):
+                snapshot = social_service.get_social_snapshot(code)
+                if snapshot:
+                    social_sentiment = {
+                        key: value
+                        for key, value in snapshot.items()
+                        if key != "context"
+                    }
+                else:
+                    social_sentiment = {
+                        "available": False,
+                        "reason": "no_ticker_data",
+                    }
+            else:
+                social_sentiment = {
+                    "available": False,
+                    "reason": "not_configured",
+                }
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"社交舆情获取失败: {exc}")
+            social_sentiment = {
+                "available": False,
+                "reason": "fetch_failed",
+            }
+
+    if social_sentiment and "available" not in social_sentiment:
+        social_sentiment["available"] = bool(social_sentiment.get("available_sources"))
+
+    summary = _build_dsa_analysis_summary(candidate, quote, fundamentals, news, social_sentiment)
     context = {
-        "enriched": bool(quote or fundamentals or news.get("results")),
+        "enriched": bool(quote or fundamentals or news.get("results") or social_sentiment.get("available")),
         "profile": profile,
         "news_included": bool(include_news),
         "quote": quote,
         "fundamentals": fundamentals,
         "news": news,
+        "social_sentiment": social_sentiment,
         "warnings": _dedupe_strings(warnings),
     }
     return {
@@ -5883,6 +5943,7 @@ def _build_dsa_analysis_summary(
     quote: Dict[str, Any],
     fundamentals: Dict[str, Any],
     news: Dict[str, Any],
+    social_sentiment: Optional[Dict[str, Any]] = None,
 ) -> str:
     parts: List[str] = []
     price = _first_non_empty(quote.get("price"), candidate.get("price"))
@@ -5905,6 +5966,35 @@ def _build_dsa_analysis_summary(
         titles = [title for title in titles if title]
         if titles:
             parts.append(f"DSA新闻：{'；'.join(titles[:2])}")
+
+    if isinstance(social_sentiment, dict) and social_sentiment.get("available"):
+        source_labels = {
+            "reddit": "Reddit",
+            "x": "X",
+            "polymarket": "Polymarket",
+        }
+        sources = [
+            source_labels.get(str(source), str(source))
+            for source in social_sentiment.get("available_sources") or []
+        ]
+        platform_data = social_sentiment.get("platforms")
+        platform_data = platform_data if isinstance(platform_data, dict) else {}
+        sentiments = [
+            _safe_float(metrics.get("sentiment_score"))
+            for metrics in platform_data.values()
+            if isinstance(metrics, dict) and _safe_float(metrics.get("sentiment_score")) is not None
+        ]
+        sentiment_label = ""
+        if sentiments:
+            average_sentiment = sum(value for value in sentiments if value is not None) / len(sentiments)
+            if average_sentiment >= 0.15:
+                sentiment_label = "，整体偏正面"
+            elif average_sentiment <= -0.15:
+                sentiment_label = "，整体偏负面"
+            else:
+                sentiment_label = "，整体中性"
+        source_text = "/".join(sources) if sources else "社交平台"
+        parts.append(f"DSA舆情：已覆盖 {source_text}{sentiment_label}")
 
     if not parts:
         return ""

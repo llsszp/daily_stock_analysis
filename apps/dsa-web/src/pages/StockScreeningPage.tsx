@@ -423,6 +423,48 @@ const getIntradayWindowText = (item: AlphaSiftCandidate) => {
   return parts.length ? parts.join(' · ') : '未获取到连续分时数据';
 };
 
+const SOCIAL_SOURCE_LABELS: Record<string, string> = {
+  reddit: 'Reddit',
+  x: 'X',
+  polymarket: 'Polymarket',
+};
+
+const getSocialSentimentText = (item: AlphaSiftCandidate) => {
+  const social = item.dsaContext?.socialSentiment;
+  if (!social) {
+    return '';
+  }
+  if (!social.available) {
+    if (social.reason === 'not_configured') {
+      return '未配置社交舆情服务';
+    }
+    if (social.reason === 'fetch_failed') {
+      return '本次舆情请求失败';
+    }
+    return '本次未找到该股票的社交舆情';
+  }
+  const platforms = social.platforms || {};
+  const details = Object.entries(platforms).flatMap(([source, metrics]) => {
+    if (!metrics || Object.keys(metrics).length === 0) {
+      return [];
+    }
+    const parts = [SOCIAL_SOURCE_LABELS[source] || source];
+    if (metrics.sentimentScore != null) {
+      parts.push(`情绪 ${Number(metrics.sentimentScore).toFixed(2)}`);
+    }
+    if (metrics.buzzScore != null) {
+      parts.push(`热度 ${Number(metrics.buzzScore).toFixed(0)}`);
+    }
+    if (metrics.mentions != null) {
+      parts.push(`提及 ${Number(metrics.mentions).toLocaleString()}`);
+    }
+    return [parts.join(' · ')];
+  });
+  return details.length
+    ? details.join('；')
+    : (social.availableSources || []).map((source) => SOCIAL_SOURCE_LABELS[source] || source).join(' / ');
+};
+
 const toMessageList = (values: string[] | undefined) =>
   Array.isArray(values) ? values.map((value) => String(value).trim()).filter(Boolean) : [];
 
@@ -1862,6 +1904,7 @@ const StockScreeningPage: React.FC = () => {
                       : '暂无 LLM 判断';
                   const dsaWarnings = item.dsaContext?.warnings || [];
                   const dsaNews = item.dsaNews || [];
+                  const socialSentimentText = getSocialSentimentText(item);
                   const quote = item.dsaContext?.quote || {};
                   const marketSessionValue = quote.marketSession ?? quote.market_session;
                   const marketSession = typeof marketSessionValue === 'string' ? marketSessionValue : 'unknown';
@@ -2024,6 +2067,12 @@ const StockScreeningPage: React.FC = () => {
                                     <p className="mt-1 text-sm text-secondary-text">无</p>
                                   )}
                                 </div>
+                                {socialSentimentText ? (
+                                  <div>
+                                    <p className="text-xs font-semibold text-secondary-text">DSA 舆情</p>
+                                    <p className="mt-1 text-sm leading-6 text-foreground">{socialSentimentText}</p>
+                                  </div>
+                                ) : null}
                                 {dsaWarnings.length > 0 ? (
                                   <div>
                                     <p className="text-xs font-semibold text-secondary-text">DSA 增强提示</p>

@@ -76,6 +76,18 @@ export type AlphaSiftCandidate = {
       results?: Array<Record<string, unknown>>;
       error?: string | null;
     };
+    socialSentiment?: {
+      available?: boolean;
+      source?: string;
+      availableSources?: string[];
+      reason?: string;
+      platforms?: Record<string, {
+        buzzScore?: number | null;
+        sentimentScore?: number | null;
+        mentions?: number | null;
+        trend?: string | null;
+      }>;
+    };
     warnings?: string[];
   };
   dsaNews?: Array<{

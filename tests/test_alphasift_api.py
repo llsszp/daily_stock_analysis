@@ -2791,6 +2791,69 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         self.assertIn(quota_warning, candidate["dsa_context"]["warnings"])
         self.assertIn(quota_warning, payload["warnings"])
 
+    def test_us_candidate_enrichment_reuses_structured_social_sentiment(self) -> None:
+        fake_manager = SimpleNamespace(get_stock_name=MagicMock(return_value="Apple"))
+        social_service = SimpleNamespace(
+            is_available=True,
+            get_social_snapshot=MagicMock(
+                return_value={
+                    "ticker": "AAPL",
+                    "source": "api.adanos.org",
+                    "available_sources": ["reddit", "x"],
+                    "platforms": {
+                        "reddit": {
+                            "buzz_score": 82,
+                            "sentiment_score": 0.24,
+                            "mentions": 340,
+                        },
+                        "x": {
+                            "buzz_score": 65,
+                            "sentiment_score": 0.12,
+                        },
+                    },
+                }
+            ),
+        )
+        candidate = {"code": "AAPL", "name": "Apple", "raw": {}}
+
+        with (
+            patch("src.services.alphasift_service._get_dsa_fetcher_manager", return_value=fake_manager),
+            patch(
+                "src.services.alphasift_service.get_dsa_realtime_quote",
+                return_value={"price": 220.0, "change_pct": 1.1},
+            ),
+            patch(
+                "src.services.alphasift_service.get_dsa_fundamental_context",
+                return_value={"market": "us", "coverage": {"earnings": "available"}},
+            ),
+            patch(
+                "src.services.alphasift_service.search_dsa_stock_news",
+                return_value={
+                    "success": True,
+                    "provider": "YahooFinance",
+                    "results": [{"title": "Apple reports services growth", "source": "Reuters"}],
+                },
+            ),
+            patch(
+                "src.services.alphasift_service._get_dsa_social_sentiment_service",
+                return_value=social_service,
+            ),
+        ):
+            enriched = alphasift_service._build_dsa_candidate_context(candidate)
+
+        social = enriched["dsa_context"]["social_sentiment"]
+        self.assertTrue(social["available"])
+        self.assertEqual(social["platforms"]["reddit"]["mentions"], 340)
+        self.assertIn("DSA舆情", enriched["dsa_analysis_summary"])
+        self.assertIn("整体偏正面", enriched["dsa_analysis_summary"])
+        ai_context = alphasift_service._build_dsa_candidate_ai_score_context(
+            {**candidate, **enriched},
+            strategy="dsa_us_short_swing_recovery",
+            market="us",
+        )
+        self.assertEqual(ai_context["social_sentiment"]["available_sources"], ["reddit", "x"])
+        social_service.get_social_snapshot.assert_called_once_with("AAPL")
+
     def test_us_stock_news_filters_stale_supplier_article(self) -> None:
         search_service = MagicMock()
         search_service.is_available = True
