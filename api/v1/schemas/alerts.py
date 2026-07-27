@@ -41,6 +41,15 @@ class AlertRuleUpdateRequest(BaseModel):
     notification_policy: Optional[Dict[str, Any]] = None
 
 
+class AlertTrailingState(BaseModel):
+    activated: bool
+    activated_at: Optional[str] = None
+    peak_price: Optional[float] = None
+    last_price: Optional[float] = None
+    data_timestamp: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 class AlertRuleItem(BaseModel):
     id: int
     name: str
@@ -56,6 +65,8 @@ class AlertRuleItem(BaseModel):
     last_triggered_at: Optional[str] = None
     cooldown_until: Optional[str] = None
     cooldown_active: Optional[bool] = None
+    cooldown_seconds: Optional[int] = None
+    trailing_state: Optional[AlertTrailingState] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

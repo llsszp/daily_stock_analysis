@@ -645,6 +645,8 @@ class AlertApiTestCase(unittest.TestCase):
             "trail_mode": "percent",
             "trail_value": 5.0,
         })
+        self.assertEqual(rule["cooldown_seconds"], 86400)
+        self.assertFalse(rule["trailing_state"]["activated"])
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
@@ -660,6 +662,36 @@ class AlertApiTestCase(unittest.TestCase):
         self.assertIsNone(
             AlertRepository(self.db).get_trailing_state(rule_id=rule["id"], target="AAPL")
         )
+
+    def test_trailing_stop_rule_response_includes_persisted_activation_state(self) -> None:
+        rule = self._create_rule({
+            "name": "AAPL trailing stop",
+            "target": "AAPL",
+            "alert_type": "trailing_stop",
+            "parameters": {
+                "activation_price": 200,
+                "trail_mode": "amount",
+                "trail_value": 5,
+            },
+        })
+        activated_at = datetime(2026, 7, 15, 14, 28, 0)
+        AlertRepository(self.db).upsert_trailing_state(
+            rule_id=rule["id"],
+            target="AAPL",
+            activated_at=activated_at,
+            peak_price=220.5,
+            last_price=218.25,
+            data_timestamp=datetime(2026, 7, 15, 14, 29, 0),
+        )
+
+        detail_resp = self.client.get(f"/api/v1/alerts/rules/{rule['id']}")
+
+        self.assertEqual(detail_resp.status_code, 200, detail_resp.text)
+        state = detail_resp.json()["trailing_state"]
+        self.assertTrue(state["activated"])
+        self.assertEqual(state["activated_at"], activated_at.isoformat())
+        self.assertEqual(state["peak_price"], 220.5)
+        self.assertEqual(state["last_price"], 218.25)
 
     def test_trailing_stop_update_resets_state_only_when_tracking_config_changes(self) -> None:
         rule = self._create_rule({

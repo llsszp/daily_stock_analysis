@@ -314,7 +314,7 @@ const AlertsPage: React.FC = () => {
   };
 
   return (
-    <AppPage className="space-y-5">
+    <AppPage className="max-w-[1600px] space-y-5">
       <PageHeader
         eyebrow="Alert Center"
         title="告警中心"
@@ -336,7 +336,7 @@ const AlertsPage: React.FC = () => {
       ) : null}
       {rulesError ? <ApiErrorAlert error={rulesError} onDismiss={() => setRulesError(null)} /> : null}
 
-      <div className="grid items-stretch gap-5 xl:grid-cols-[380px_minmax(0,1fr)]">
+      <div className="grid items-stretch gap-5 xl:grid-cols-[320px_minmax(0,1fr)]">
         <div ref={formRef}>
           <AlertRuleForm
             key={editingRule?.id ?? 'create'}

@@ -48,6 +48,15 @@ export interface AlertRuleParameters {
   minDrop?: number;
 }
 
+export interface AlertTrailingState {
+  activated: boolean;
+  activatedAt?: string | null;
+  peakPrice?: number | null;
+  lastPrice?: number | null;
+  dataTimestamp?: string | null;
+  updatedAt?: string | null;
+}
+
 export interface AlertRuleItem {
   id: number;
   name: string;
@@ -63,6 +72,8 @@ export interface AlertRuleItem {
   lastTriggeredAt?: string | null;
   cooldownUntil?: string | null;
   cooldownActive?: boolean | null;
+  cooldownSeconds?: number | null;
+  trailingState?: AlertTrailingState | null;
   createdAt?: string | null;
   updatedAt?: string | null;
 }

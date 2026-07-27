@@ -31,7 +31,7 @@ from src.market_phase_summary import (
     format_public_phase_pack_excerpt,
     render_market_phase_summary,
 )
-from src.services.alert_service import AlertService
+from src.services.alert_service import AlertService, DEFAULT_DB_ALERT_COOLDOWN_SECONDS
 from src.services.decision_signal_service import DecisionSignalService
 from src.services.decision_signal_summary import (
     format_decision_signal_excerpt,
@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from src.notification import ChannelAttemptResult, NotificationDispatchResult
 
 ALERT_WORKER_FINGERPRINT_TTL_SECONDS = 24 * 60 * 60
-DEFAULT_DB_ALERT_COOLDOWN_SECONDS = 24 * 60 * 60
 ALERT_WORKER_RULE_LIMIT = 1000
 WRITABLE_TRIGGER_STATUSES = frozenset({"triggered", "skipped", "degraded", "failed"})
 

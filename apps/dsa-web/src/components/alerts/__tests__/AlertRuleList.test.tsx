@@ -143,7 +143,62 @@ describe('AlertRuleList', () => {
       ],
     });
 
-    expect(screen.getByText('未冷却')).toBeInTheDocument();
+    expect(screen.getByText('可通知')).toBeInTheDocument();
+    expect(screen.getByText('通知后冷却 1 天')).toBeInTheDocument();
+  });
+
+  it('renders trailing-stop activation, peak, and latest price in the runtime status', () => {
+    renderList({
+      rules: [
+        {
+          id: 9,
+          name: 'QQQ 跟踪止损',
+          targetScope: 'single_symbol',
+          target: 'QQQ',
+          alertType: 'trailing_stop',
+          parameters: { activationPrice: 725.82, trailMode: 'amount', trailValue: 5 },
+          severity: 'warning',
+          enabled: true,
+          source: 'api',
+          cooldownActive: false,
+          cooldownSeconds: 86400,
+          trailingState: {
+            activated: true,
+            activatedAt: '2026-07-15T14:28:00',
+            peakPrice: 731.25,
+            lastPrice: 729.8,
+          },
+        },
+      ],
+    });
+
+    expect(screen.getByText('激活价 725.82 · 最高价回撤 5')).toBeInTheDocument();
+    expect(screen.getByText('跟踪中')).toBeInTheDocument();
+    expect(screen.getByText('最高 731.25 · 当前 729.8')).toBeInTheDocument();
+    expect(screen.getByText(/激活于/)).toBeInTheDocument();
+  });
+
+  it('distinguishes an enabled trailing stop that has not reached its activation price', () => {
+    renderList({
+      rules: [
+        {
+          id: 10,
+          name: 'AAPL 跟踪止损',
+          targetScope: 'single_symbol',
+          target: 'AAPL',
+          alertType: 'trailing_stop',
+          parameters: { activationPrice: 220, trailMode: 'percent', trailValue: 5 },
+          severity: 'warning',
+          enabled: true,
+          source: 'api',
+          cooldownActive: false,
+          trailingState: { activated: false },
+        },
+      ],
+    });
+
+    expect(screen.getByText('等待激活')).toBeInTheDocument();
+    expect(screen.queryByText('跟踪中')).not.toBeInTheDocument();
   });
 
   it('renders portfolio scope labels and child-target cooldown hint', () => {

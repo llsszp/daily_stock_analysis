@@ -81,7 +81,7 @@ describe('AlertRuleForm', () => {
 
     fireEvent.change(screen.getByLabelText('标的代码'), { target: { value: 'aapl' } });
     fireEvent.change(screen.getByLabelText('规则类型'), { target: { value: 'trailing_stop' } });
-    fireEvent.change(screen.getByLabelText('启用跟踪价格'), { target: { value: '200' } });
+    fireEvent.change(screen.getByLabelText('跟踪激活价'), { target: { value: '200' } });
     fireEvent.change(screen.getByLabelText('最高价回撤比例（%）'), { target: { value: '6' } });
     fireEvent.click(screen.getByRole('button', { name: '创建规则' }));
 
@@ -118,7 +118,7 @@ describe('AlertRuleForm', () => {
     expect(screen.getByRole('heading', { name: '编辑告警规则' })).toBeInTheDocument();
     expect(screen.getByLabelText('规则名称')).toHaveValue('AAPL 跟踪止损');
     expect(screen.getByLabelText('标的代码')).toHaveValue('AAPL');
-    expect(screen.getByLabelText('启用跟踪价格')).toHaveValue(200);
+    expect(screen.getByLabelText('跟踪激活价')).toHaveValue(200);
     expect(screen.getByLabelText('回撤方式')).toHaveValue('amount');
     expect(screen.getByLabelText('最高价回撤金额')).toHaveValue(5);
 

@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useState } from 'react';
-import { Bell, Pencil, Trash2 } from 'lucide-react';
-import { Badge, Button, Card, ConfirmDialog, EmptyState, Pagination, Select } from '../common';
+import { Bell, FlaskConical, Pause, Pencil, Play, Trash2 } from 'lucide-react';
+import { Badge, Button, Card, ConfirmDialog, EmptyState, Pagination, Select, Tooltip } from '../common';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
 import { formatUiText, type UiLanguage } from '../../i18n/uiText';
 import {
@@ -45,7 +45,7 @@ function formatParameters(rule: AlertRuleItem, language: UiLanguage): string {
     const trailValue = rule.parameters.trailValue ?? '--';
     const suffix = rule.parameters.trailMode === 'percent' ? '%' : '';
     return language === 'zh'
-      ? `启用价 ${rule.parameters.activationPrice ?? '--'} · 最高价回撤 ${trailValue}${suffix}`
+      ? `激活价 ${rule.parameters.activationPrice ?? '--'} · 最高价回撤 ${trailValue}${suffix}`
       : `Activate ${rule.parameters.activationPrice ?? '--'} · Peak drawdown ${trailValue}${suffix}`;
   }
   if (rule.alertType === 'price_change_percent') {
@@ -78,6 +78,25 @@ function formatParameters(rule: AlertRuleItem, language: UiLanguage): string {
 
 function isCoolingDown(rule: AlertRuleItem): boolean {
   return rule.cooldownActive === true;
+}
+
+function formatCooldownDuration(seconds: number | null | undefined, language: UiLanguage): string {
+  const value = seconds ?? 24 * 60 * 60;
+  if (value % 86400 === 0) return language === 'zh' ? `${value / 86400} 天` : `${value / 86400}d`;
+  if (value % 3600 === 0) return language === 'zh' ? `${value / 3600} 小时` : `${value / 3600}h`;
+  if (value % 60 === 0) return language === 'zh' ? `${value / 60} 分钟` : `${value / 60}m`;
+  return language === 'zh' ? `${value} 秒` : `${value}s`;
+}
+
+function formatCooldownPolicy(rule: AlertRuleItem, language: UiLanguage): string {
+  const text = ALERT_LIST_TEXT[language];
+  const seconds = rule.cooldownSeconds ?? 24 * 60 * 60;
+  if (seconds <= 0) return text.cooldownDisabled;
+  return formatUiText(text.cooldownAfter, { duration: formatCooldownDuration(seconds, language) });
+}
+
+function formatPrice(value: number | null | undefined): string {
+  return value == null ? '--' : String(Number(value.toFixed(4)));
 }
 
 function formatTarget(rule: AlertRuleItem, language: UiLanguage): string {
@@ -142,6 +161,41 @@ export const AlertRuleList: React.FC<AlertRuleListProps> = ({
     busyRule?.id === rule.id && busyRule.action === action
   );
 
+  const renderRuntimeStatus = (rule: AlertRuleItem) => {
+    const isTrailingStop = rule.alertType === 'trailing_stop';
+    const isActivated = rule.trailingState?.activated === true;
+    let label: string = rule.enabled ? text.enabled : text.disabled;
+    let variant: 'success' | 'warning' | 'default' = rule.enabled ? 'success' : 'default';
+
+    if (isTrailingStop) {
+      if (!rule.enabled) label = isActivated ? text.disabledActivated : text.disabled;
+      else if (isActivated) label = text.tracking;
+      else {
+        label = text.waitingActivation;
+        variant = 'warning';
+      }
+    }
+
+    return (
+      <div className="space-y-1.5 whitespace-nowrap">
+        <Badge variant={variant}>{label}</Badge>
+        {isTrailingStop && isActivated ? (
+          <div className="text-xs text-secondary-text">
+            {formatUiText(text.peakAndLast, {
+              peak: formatPrice(rule.trailingState?.peakPrice),
+              last: formatPrice(rule.trailingState?.lastPrice),
+            })}
+          </div>
+        ) : null}
+        {isTrailingStop && rule.trailingState?.activatedAt ? (
+          <div className="text-xs text-muted-text">
+            {formatUiText(text.activatedAt, { time: formatDateTime(rule.trailingState.activatedAt) })}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
   return (
     <Card
       title={text.title}
@@ -179,26 +233,26 @@ export const AlertRuleList: React.FC<AlertRuleListProps> = ({
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-x-auto">
-          <table className="w-full min-w-[960px] text-left text-sm">
+          <table className="w-full min-w-[1015px] table-fixed text-left text-sm">
             <thead className="border-b border-border/60 text-xs uppercase text-muted-text">
               <tr>
-                <th className="px-3 py-2 font-medium">{text.rule}</th>
-                <th className="px-3 py-2 font-medium">{text.target}</th>
-                <th className="px-3 py-2 font-medium">{text.type}</th>
-                <th className="px-3 py-2 font-medium">{text.parameters}</th>
-                <th className="px-3 py-2 font-medium">{text.status}</th>
-                <th className="px-3 py-2 font-medium">{text.cooldown}</th>
-                <th className="px-3 py-2 font-medium">{text.updatedAt}</th>
-                <th className="sticky right-0 z-10 min-w-[184px] border-l border-border/60 bg-card px-3 py-2 text-right font-medium">
+                <th className="w-[145px] px-3 py-2 font-medium">{text.rule}</th>
+                <th className="w-[70px] px-3 py-2 font-medium">{text.target}</th>
+                <th className="w-[90px] px-3 py-2 font-medium">{text.type}</th>
+                <th className="w-[180px] px-3 py-2 font-medium">{text.parameters}</th>
+                <th className="w-[155px] px-3 py-2 font-medium">{text.status}</th>
+                <th className="w-[135px] px-3 py-2 font-medium">{text.cooldown}</th>
+                <th className="w-[95px] px-3 py-2 font-medium">{text.updatedAt}</th>
+                <th className="sticky right-0 z-10 w-[145px] border-l border-border/60 bg-card px-3 py-2 text-right font-medium">
                   {text.action}
                 </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/40">
               {rules.map((rule) => (
-                <tr key={rule.id} className="align-top">
+                <tr key={rule.id} className="align-middle">
                   <td className="px-3 py-3">
-                    <div className="font-medium text-foreground">{rule.name}</div>
+                    <div className="truncate font-medium text-foreground">{rule.name}</div>
                     <div className="mt-1 text-xs text-muted-text">{formatUiText(text.source, { source: rule.source })}</div>
                   </td>
                   <td className="px-3 py-3 text-secondary-text">
@@ -213,62 +267,84 @@ export const AlertRuleList: React.FC<AlertRuleListProps> = ({
                       </Badge>
                     </div>
                   </td>
-                  <td className="px-3 py-3 text-secondary-text">{formatParameters(rule, language)}</td>
+                  <td className="px-3 py-3 text-secondary-text">
+                    <Tooltip content={formatParameters(rule, language)} className="max-w-full">
+                      <span className="block truncate whitespace-nowrap">{formatParameters(rule, language)}</span>
+                    </Tooltip>
+                  </td>
                   <td className="px-3 py-3">
-                    <Badge variant={rule.enabled ? 'success' : 'default'}>
-                      {rule.enabled ? text.enabled : text.disabled}
-                    </Badge>
+                    {renderRuntimeStatus(rule)}
                   </td>
                   <td className="px-3 py-3 text-xs text-secondary-text">
-                    <div>{isCoolingDown(rule) ? text.coolingDown : text.notCoolingDown}</div>
-                    <div className="mt-1">{formatDateTime(rule.cooldownUntil)}</div>
+                    <Badge variant={isCoolingDown(rule) ? 'warning' : 'default'}>
+                      {isCoolingDown(rule) ? text.coolingDown : text.readyToNotify}
+                    </Badge>
+                    <div className="mt-1 whitespace-nowrap">
+                      {isCoolingDown(rule)
+                        ? formatDateTime(rule.cooldownUntil)
+                        : formatCooldownPolicy(rule, language)}
+                    </div>
                     {hasChildTargetCooldown(rule) ? (
                       <div className="mt-1 text-muted-text">{text.childTargetCooldown}</div>
                     ) : null}
                   </td>
-                  <td className="px-3 py-3 text-xs text-secondary-text">{formatDateTime(rule.updatedAt ?? rule.createdAt)}</td>
-                  <td className="sticky right-0 z-[5] min-w-[184px] border-l border-border/60 bg-card px-3 py-3">
-                    <div className="grid grid-cols-2 gap-2">
-                      <Button
-                        size="xsm"
-                        variant="outline"
-                        onClick={() => onTest(rule)}
-                        isLoading={isRuleActionBusy(rule, 'test')}
-                        loadingText={text.testing}
-                        disabled={isRuleBusy(rule) && !isRuleActionBusy(rule, 'test')}
-                      >
-                        {text.test}
-                      </Button>
-                      <Button
-                        size="xsm"
-                        variant="outline"
-                        aria-label={formatUiText(text.editAria, { name: rule.name })}
-                        onClick={() => onEdit(rule)}
-                        disabled={isRuleBusy(rule)}
-                      >
-                        <Pencil className="h-3.5 w-3.5" />
-                        {text.edit}
-                      </Button>
-                      <Button
-                        size="xsm"
-                        variant={rule.enabled ? 'secondary' : 'primary'}
-                        onClick={() => onToggleEnabled(rule)}
-                        isLoading={isRuleActionBusy(rule, 'toggle')}
-                        loadingText={rule.enabled ? text.disabling : text.enabling}
-                        disabled={isRuleBusy(rule) && !isRuleActionBusy(rule, 'toggle')}
-                      >
-                        {rule.enabled ? text.disable : text.enable}
-                      </Button>
-                      <Button
-                        size="xsm"
-                        variant="danger-subtle"
-                        aria-label={formatUiText(text.deleteAria, { name: rule.name })}
-                        onClick={() => setPendingDelete(rule)}
-                        disabled={isRuleBusy(rule)}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                        {text.delete}
-                      </Button>
+                  <td className="whitespace-nowrap px-3 py-3 text-xs text-secondary-text">{formatDateTime(rule.updatedAt ?? rule.createdAt)}</td>
+                  <td className="sticky right-0 z-[5] w-[145px] border-l border-border/60 bg-card px-3 py-3">
+                    <div className="flex flex-nowrap justify-end gap-1.5">
+                      <Tooltip content={text.test}>
+                        <Button
+                          size="xsm"
+                          variant="outline"
+                          className="w-6 shrink-0 px-0"
+                          aria-label={isRuleActionBusy(rule, 'test') ? text.testing : text.test}
+                          onClick={() => onTest(rule)}
+                          isLoading={isRuleActionBusy(rule, 'test')}
+                          loadingText={text.testing}
+                          disabled={isRuleBusy(rule) && !isRuleActionBusy(rule, 'test')}
+                        >
+                          <FlaskConical className="h-3.5 w-3.5" />
+                        </Button>
+                      </Tooltip>
+                      <Tooltip content={text.edit}>
+                        <Button
+                          size="xsm"
+                          variant="outline"
+                          className="w-6 shrink-0 px-0"
+                          aria-label={formatUiText(text.editAria, { name: rule.name })}
+                          onClick={() => onEdit(rule)}
+                          disabled={isRuleBusy(rule)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                      </Tooltip>
+                      <Tooltip content={rule.enabled ? text.disable : text.enable}>
+                        <Button
+                          size="xsm"
+                          variant={rule.enabled ? 'secondary' : 'primary'}
+                          className="w-6 shrink-0 px-0"
+                          aria-label={isRuleActionBusy(rule, 'toggle')
+                            ? (rule.enabled ? text.disabling : text.enabling)
+                            : (rule.enabled ? text.disable : text.enable)}
+                          onClick={() => onToggleEnabled(rule)}
+                          isLoading={isRuleActionBusy(rule, 'toggle')}
+                          loadingText={rule.enabled ? text.disabling : text.enabling}
+                          disabled={isRuleBusy(rule) && !isRuleActionBusy(rule, 'toggle')}
+                        >
+                          {rule.enabled ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                        </Button>
+                      </Tooltip>
+                      <Tooltip content={text.delete}>
+                        <Button
+                          size="xsm"
+                          variant="danger-subtle"
+                          className="w-6 shrink-0 px-0"
+                          aria-label={formatUiText(text.deleteAria, { name: rule.name })}
+                          onClick={() => setPendingDelete(rule)}
+                          disabled={isRuleBusy(rule)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </Tooltip>
                     </div>
                   </td>
                 </tr>

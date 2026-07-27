@@ -74,6 +74,7 @@ from src.utils.sanitize import sanitize_diagnostic_text
 
 
 TRAILING_STOP_ALERT_TYPE = "trailing_stop"
+DEFAULT_DB_ALERT_COOLDOWN_SECONDS = 24 * 60 * 60
 LEGACY_RUNTIME_ALERT_TYPES = frozenset({"price_cross", "price_change_percent", "volume_spike"})
 SYMBOL_ALERT_TYPES = LEGACY_RUNTIME_ALERT_TYPES | TECHNICAL_ALERT_TYPES | {TRAILING_STOP_ALERT_TYPE}
 SUPPORTED_ALERT_TYPES = SYMBOL_ALERT_TYPES | PORTFOLIO_ALERT_TYPES | MARKET_ALERT_TYPES
@@ -1302,8 +1303,40 @@ class AlertService:
             "last_triggered_at": cooldown_summary.get("last_triggered_at"),
             "cooldown_until": cooldown_summary.get("cooldown_until"),
             "cooldown_active": cooldown_summary.get("cooldown_active"),
+            "cooldown_seconds": self._effective_cooldown_seconds(data.get("cooldown_policy")),
+            "trailing_state": self._trailing_state_for_rule(row),
         })
         return data
+
+    @staticmethod
+    def _effective_cooldown_seconds(policy: Any) -> int:
+        if not isinstance(policy, dict) or "cooldown_seconds" not in policy:
+            return DEFAULT_DB_ALERT_COOLDOWN_SECONDS
+        try:
+            return max(0, int(policy.get("cooldown_seconds") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _trailing_state_for_rule(self, row: AlertRuleRecord) -> Optional[Dict[str, Any]]:
+        if row.alert_type != TRAILING_STOP_ALERT_TYPE:
+            return None
+        try:
+            state = self.repo.get_trailing_state(rule_id=int(row.id), target=str(row.target))
+        except Exception as exc:
+            logger.warning(
+                "[AlertService] Failed to load trailing state for rule %s: %s",
+                getattr(row, "id", "?"),
+                self._sanitize_text(str(exc) or "trailing state read failed"),
+            )
+            state = None
+        return {
+            "activated": bool(state is not None and state.activated_at is not None),
+            "activated_at": state.activated_at.isoformat() if state is not None and state.activated_at else None,
+            "peak_price": state.peak_price if state is not None else None,
+            "last_price": state.last_price if state is not None else None,
+            "data_timestamp": state.data_timestamp.isoformat() if state is not None and state.data_timestamp else None,
+            "updated_at": state.updated_at.isoformat() if state is not None and state.updated_at else None,
+        }
 
     def _serialize_rule_base(self, row: AlertRuleRecord) -> Dict[str, Any]:
         return {
