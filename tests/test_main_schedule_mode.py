@@ -267,18 +267,26 @@ class MainScheduleModeTestCase(unittest.TestCase):
         config = self._make_config(log_level="INFO")
 
         class BusySocket:
+            def setsockopt(self, level, option, value):
+                self.reuse_address = (level, option, value)
+
             def bind(self, address):
                 raise OSError("address already in use")
 
             def close(self):
                 pass
 
-        with patch("socket.socket", return_value=BusySocket()) as socket_factory, \
+        busy_socket = BusySocket()
+        with patch("socket.socket", return_value=busy_socket) as socket_factory, \
              patch("threading.Thread") as thread_cls:
             with self.assertRaises(RuntimeError) as caught:
                 main.start_api_server("127.0.0.1", 8000, config)
 
         socket_factory.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+        self.assertEqual(
+            busy_socket.reuse_address,
+            (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1),
+        )
         self.assertIn("127.0.0.1:8000", str(caught.exception))
         thread_cls.assert_not_called()
 
@@ -303,6 +311,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
             Server = _FakeUvicornServer
 
         class _UnusedSocket:
+            def setsockopt(self, level, option, value):
+                pass
+
             def bind(self, address):
                 pass
 
@@ -344,6 +355,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
                     raise TypeError("install_signal_handlers is unsupported")
 
         class _UnusedSocket:
+            def setsockopt(self, level, option, value):
+                pass
+
             def bind(self, address):
                 pass
 
